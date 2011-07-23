@@ -1,0 +1,243 @@
+module pt;
+
+import sdl, std.math, std.thread, std.boehm;
+
+import std.random;
+shared IRandom deflt_rng;
+void init() { deflt_rng = getPRNG(23); }
+
+float randf() { return std.random.base.randf deflt_rng; }
+
+struct Ray {
+  vec3f pos, dir;
+  vec3f at(float f) { return pos + f * dir; }
+}
+
+class AssertError : Error {
+  void init(string s) { super.init "Assertion failed: $s"; }
+}
+
+void assert(bool b, string s) {
+  if (!s) raise-error new AssertError s;
+}
+
+struct Result {
+  float distance;
+  vec3f normal;
+  vec3f col;
+}
+
+class SceneObject {
+  bool collide(Ray*, Result*) { assert(false, "mew"); }
+}
+
+class Plane : SceneObject {
+  vec3f normal, base;
+  void init(vec3f n, b) { normal = n; base = b; }
+  bool collide(Ray* ray, Result* res) {
+    float dist = -(normal * (ray.pos - base)).sum / (ray.dir * normal).sum;
+    if (dist < 0) return false;
+    res.distance = dist;
+    res.col = vec3f(1);
+    res.normal = normal;
+    return true;
+  }
+}
+
+class CheckerPattern : SceneObject {
+  SceneObject sup;
+  vec3f a, b;
+  void init(vec3f a, b, SceneObject so) { sup = so; this.(a, b) = (a, b); }
+  bool collide(Ray* ray, Result* res) {
+    if (!sup.collide(ray, res)) return false;
+    auto hitpos = ray.at res.distance;
+    auto hitpos_int = vec3i((hitpos).(int:x & 1, int:y & 1, int:z & 1));
+    bool checker = eval (hitpos_int.x xor hitpos_int.y xor hitpos_int.z);
+    res.col = [a, b][checker];
+    return true;
+  }
+}
+
+class Group : SceneObject {
+  SceneObject[] list;
+  bool collide(Ray* ray, Result* res) {
+    Result current;
+    float lowestDistance = -1;
+    bool foundMatch;
+    for auto obj <- list {
+      if (obj.collide(ray, &current)) {
+        if (lowestDistance < 0 || current.distance < lowestDistance) {
+          lowestDistance = current.distance;
+          *res = current;
+          foundMatch = true;
+        }
+      }
+    }
+    return foundMatch;
+  }
+}
+
+class Sphere : SceneObject {
+  vec3f center;
+  float radius;
+  void init(vec3f c, float r) { center = c; radius = r; }
+  bool collide(Ray* ray, Result* res) {
+    vec3f pos = ray.pos - center; // pretranslate so we can pretend that we're a sphere around the origin
+    float p = (2*pos*ray.dir).sum;
+    float q = ((pos*pos).sum - radius * radius);
+    
+    float inside = p*p/4 - q;
+    if (inside < 0) return false;
+    
+    float sq = sqrt inside,
+      k = -p/2,
+      k1 = k + sq,
+      k2 = k - sq;
+    if (k1 < 0) return false;
+    res.distance = [k1, k2][eval k2 > 0];
+    res.col = vec3f(1);
+    res.normal = ray.at res.distance - center #.normalize3f();
+    return true;
+  }
+}
+
+class Scale : SceneObject {
+  float factor;
+  SceneObject sup;
+  void init(float f, SceneObject so) (factor, sup) = (f, so);
+  bool collide(Ray* ray, Result* res) {
+    auto v = vec3f(factor);
+    Ray ray2 = void;
+    ray2.pos = ray.pos / v;
+    ray2.dir = ray.dir; // can't divide - must be normalized
+    if (sup.collide(&ray2, res)) {
+      res.distance *= factor; // do it here instead
+      return true;
+    } else return false;
+  }
+}
+
+class Translate : SceneObject {
+  vec3f vector;
+  SceneObject sup;
+  void init(vec3f v, SceneObject so) (vector, sup) = (v, so);
+  bool collide(Ray* ray, Result* res) {
+    Ray ray2 = void;
+    ray2.pos = ray.pos - vector;
+    ray2.dir = ray.dir;
+    return sup.collide(&ray2, res);
+  }
+}
+
+import std.time;
+void main() {
+  initBoehm debugMode => true;
+  screen(150, 150);
+  SceneObject scene;
+  using new Group {
+    list ~= new CheckerPattern(vec3f(0, 1, 0), vec3f(0, 0, 1), new Plane(vec3f(0, 1, 0), vec3f(0, 0, 0)));
+    list ~= new Translate(vec3f(0, 0, 5), new Scale(0.2, new CheckerPattern(vec3f(0, 1, 0), vec3f(1, 0, 0), new Sphere(vec3f(0, 0, 0), 10))));
+    scene = that;
+  }
+  vec3f[] resbuffer = new vec3f[] (display.w * display.h);
+  float desired-fps = 30;
+  float lightrot = 0;
+  auto start = sec();
+  int iters;
+  (int, int) desired-display-size = display.(w, h);
+  
+  void render(int yfrom, yto) {
+    vec3f lightpos = vec3f(sin(lightrot) * 10 - 5, 5, cos(lightrot) * 10);
+    (int dw, int dh) = desired-display-size;
+    for (int y, int x) <- cross(yfrom..yto, 0..dw) {
+      float fx = x / (display.w/2f) - 1f, fy = 1f - y / (display.h/2f);
+      Ray ray = void;
+      ray.(pos, dir) = (vec3f(0, 2, 0), normalize3f vec3f(fx, fy, 1));
+      Result res = void;
+      if (scene.collide(&ray, &res)) {
+        auto nspos = ray.at (res.distance * 0.99);
+        // writeln "nspos = $(ray.(pos, dir)) @ $(res.distance) = $(nspos)";
+        Result res2 = void;
+        Ray lightray = void;
+        vec3f lightdir = lightpos - nspos;
+        lightray.pos = nspos;
+        lightray.dir = normalize3f lightdir;
+        // writeln "lightray is $(lightray.(pos, dir))";
+        float lightdist = |lightdir|;
+        float lightangle = (lightdir / lightdist) * res.normal #.sum;
+        if (scene.collide(&lightray, &res2) && res2.distance < lightdist || lightangle < 0) {
+          resbuffer[y * dw + x] = vec3f(0);
+        } else {
+          resbuffer[y * dw + x] = res.col * lightangle;
+        }
+      } else {
+        resbuffer[y * dw + x] = vec3f(0);
+      }
+    }
+  }
+  alias nums = 4; // number of subdivisions
+  auto tp = new ThreadPool nums;
+  auto resbuffer-lock = new ReadWriteLock;
+  
+  bool stop;
+  using new ThreadPool 1::
+  addTask delegate void() {
+    auto last-printed = sec();
+    while !stop {
+      resbuffer-lock.lock-read();
+        for int i <- 0..nums {
+          auto rdg = &render;
+          tp.addTask new delegate void() { int step = display.h / nums; rdg(step * i, step * (i + 1)); };
+        }
+        tp.waitComplete;
+      resbuffer-lock.unlock();
+      iters ++;
+      // render();
+      lightrot += 0.1;
+      auto delta = float:(sec() - start), fps = iters / delta;
+      // reconfigure window size to reach target fps
+      float pixelfactor = desired-fps / fps, psq = sqrtf pixelfactor;
+      float absf(float f) { if (f < 0) return -f; return f; }
+      if (float:(sec() - last-printed) > 5) {
+        writeln "[fps $fps] [wanted $desired-fps] [res $desired-display-size] [speed $(display.(w*h) * iters / delta / 1_000_000)mrps]";
+        last-printed = sec();
+      }
+      if (absf (pixelfactor - 1) > 0.05 && delta > 1) {
+        if (psq < 0.7) psq = 0.7;
+        (int, int) updated-size = (int:(display.w / psq), int:(display.h / psq));
+        desired-display-size = updated-size;
+        resbuffer-lock.lock-write();
+          resbuffer.free;
+          resbuffer = new vec3f[] (updated-size[0] * updated-size[1]);
+        resbuffer-lock.unlock();
+        // reset estimation
+        iters = 0; start = sec();
+      }
+    }
+  };
+  set-handler(Error err) {
+    writeln "$err. Exiting. ";
+    invoke-exit "main-return";
+  }
+  define-exit "main-return" {
+    stop = true;
+    waitComplete;
+    return;
+  }
+  while (true) {
+    auto start-draw = sec();
+    resbuffer-lock.lock-read();
+      for (int y, int x) <- cross(0..display.h, 0..display.w) {
+        display.pset(x, y, resbuffer[y * display.w + x]);
+      }
+    resbuffer-lock.unlock();
+    flip;
+    auto end-draw = sec();
+    auto should-take = 1f / desired-fps, delta = should-take-end-draw+start-draw /* abusive */;
+    if (should-take > 0)
+      sleep should-take;
+    if (display.(w != desired-display-size[0] || h != desired-display-size[1])) {
+      screen desired-display-size;
+    }
+  }
+}

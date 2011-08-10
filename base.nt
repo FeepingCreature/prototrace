@@ -1,0 +1,36 @@
+module base;
+
+import std.random;
+shared IRandom deflt_rng;
+void init() { deflt_rng = getPRNG(23); }
+
+float randf() { return std.random.base.randf deflt_rng; }
+
+struct Ray {
+  vec3f pos, dir;
+  string toString() return "[$pos + k $dir]";
+}
+
+class AssertError : Error {
+  void init(string s) { super.init "Assertion failed: $s"; }
+}
+
+void assert(bool b, string s) {
+  if (!s) raise-error new AssertError s;
+}
+
+struct Result {
+  float distance;
+  vec3f normal;
+  vec3f col;
+  bool success;
+  string toString() {
+    if (success) {
+      return "[res: hit at $distance: nor $normal, col $col]";
+    } else {
+      return "[res: no hit]";
+    }
+  }
+}
+
+interface CommandHandler;

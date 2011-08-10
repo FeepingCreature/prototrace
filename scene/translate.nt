@@ -1,0 +1,53 @@
+module scene.translate;
+
+import scene.base;
+
+extern(C) void fast_translate_process(VMState*, int numstates, vec3f vector, void* self);
+
+class Translate : SceneObject {
+  vec3f vector;
+  SceneObject sup;
+  class PostTranslate : CommandHandler {
+    void process(VMState[] list) {
+      for int i <- 0 .. list.length {
+        auto sp = &list[i];
+        
+        if (void*:sp.handler == void*:CommandHandler:this)::
+        sp.stream = sp.stream[1..$];
+        
+        using sp mixin(freeRay.replace("!!", "1"));
+      }
+    }
+  }
+  void init(vec3f v, SceneObject so) (vector, sup) = (v, so);
+  bool collide(Ray* ray, Result* res) {
+    Ray ray2 = void;
+    ray2.pos = ray.pos - vector;
+    ray2.dir = ray.dir;
+    return sup.collide(&ray2, res);
+  }
+  void process(VMState[] list) {
+    fast_translate_process(list.ptr, list.length, vector, void*:CommandHandler:this);
+    return;
+    for int i <- 0 .. list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      auto ray = sp.ray;
+      using sp mixin(allocRay);
+      sp.ray.(pos, dir) = ray.(pos - vector, dir);
+    }
+  }
+  CommandHandler[] buildCommandStream(VMStats* stats) {
+    stats.rays-needed-cur ++;
+    auto res = CommandHandler[]:null ~ this ~ sup.buildCommandStream(stats) ~ new PostTranslate;
+    using stats {
+      if (rays-needed-cur > rays-needed-max)
+        rays-needed-max = rays-needed-cur;
+      rays-needed-cur --;
+    }
+   return res;
+  }
+}

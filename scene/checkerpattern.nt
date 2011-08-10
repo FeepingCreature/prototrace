@@ -1,0 +1,39 @@
+module scene.checkerpattern;
+
+import scene.base;
+
+extern(C) void fast_checker_process(VMState*, int numstates, vec3f a, b, void* self);
+
+class CheckerPattern : SceneObject {
+  SceneObject sup;
+  vec3f a, b;
+  void init(vec3f a, b, SceneObject so) { sup = so; this.(a, b) = (a, b); }
+  bool collide(Ray* ray, Result* res) {
+    if (!sup.collide(ray, res)) return false;
+    auto hitpos = ray.(pos + dir * res.distance);
+    auto hitpos_int = vec3i((hitpos).(int:x & 1, int:y & 1, int:z & 1));
+    bool checker = eval (hitpos_int.x xor hitpos_int.y xor hitpos_int.z);
+    res.col = [a, b][checker];
+    return true;
+  }
+  void process(VMState[] list) {
+    fast_checker_process(list.ptr, list.length, a, b, void*:CommandHandler:this);
+    return;
+    for int i <- 0..list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      auto res = sp.result;
+      if (res.success) {
+        auto hitpos = sp.ray.(pos + dir * res.distance);
+        bool checker = eval ((int:hitpos.x & 1) xor (int:hitpos.y & 1) xor (int:hitpos.z & 1));
+        res.col = [a, b][checker];
+      }
+    }
+  }
+  CommandHandler[] buildCommandStream(VMStats* stats) {
+    return sup.buildCommandStream(stats) ~ this;
+  }
+}

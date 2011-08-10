@@ -1,0 +1,20 @@
+module scene.base;
+
+public import base, vm;
+
+public import std.math;
+
+interface CommandHandler {
+  void process(VMState[] list);
+}
+
+struct VMStats {
+  int results-needed-max, results-needed-cur;
+  int rays-needed-max, rays-needed-cur;
+}
+
+class SceneObject : CommandHandler {
+  bool collide(Ray*, Result*) { assert(false, "mew"); }
+  void process(VMState[] list) { assert(false, "$this::process not implemented! "); }
+  CommandHandler[] buildCommandStream(VMStats*) { assert(false, "$this::buildCommandStream not implemented! "); }
+}

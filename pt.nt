@@ -1,182 +1,198 @@
 module pt;
 
-import sdl, std.math, std.thread, std.boehm;
+import sdl, opengl, std.math, std.thread, std.boehm, std.file, std.string;
 
-import std.random;
-shared IRandom deflt_rng;
-void init() { deflt_rng = getPRNG(23); }
+import
+  scene.checkerpattern, scene.group, scene.plane, scene.scale,
+  scene.sphere, scene.translate, scene.triangle, scene.base;
 
-float randf() { return std.random.base.randf deflt_rng; }
-
-struct Ray {
-  vec3f pos, dir;
-  vec3f at(float f) { return pos + f * dir; }
+extern(C) {
+  void fastsetup(int yfrom, yto, dw, dh, VMState*);
+  void fast_light_process(VMState*, int numstates, vec3f* lightpos, void* self);
 }
 
-class AssertError : Error {
-  void init(string s) { super.init "Assertion failed: $s"; }
-}
-
-void assert(bool b, string s) {
-  if (!s) raise-error new AssertError s;
-}
-
-struct Result {
-  float distance;
-  vec3f normal;
-  vec3f col;
-}
-
-class SceneObject {
-  bool collide(Ray*, Result*) { assert(false, "mew"); }
-}
-
-class Plane : SceneObject {
-  vec3f normal, base;
-  void init(vec3f n, b) { normal = n; base = b; }
-  bool collide(Ray* ray, Result* res) {
-    float dist = -(normal * (ray.pos - base)).sum / (ray.dir * normal).sum;
-    if (dist < 0) return false;
-    res.distance = dist;
-    res.col = vec3f(1);
-    res.normal = normal;
-    return true;
-  }
-}
-
-class CheckerPattern : SceneObject {
-  SceneObject sup;
-  vec3f a, b;
-  void init(vec3f a, b, SceneObject so) { sup = so; this.(a, b) = (a, b); }
-  bool collide(Ray* ray, Result* res) {
-    if (!sup.collide(ray, res)) return false;
-    auto hitpos = ray.at res.distance;
-    auto hitpos_int = vec3i((hitpos).(int:x & 1, int:y & 1, int:z & 1));
-    bool checker = eval (hitpos_int.x xor hitpos_int.y xor hitpos_int.z);
-    res.col = [a, b][checker];
-    return true;
-  }
-}
-
-class Group : SceneObject {
-  SceneObject[] list;
-  bool collide(Ray* ray, Result* res) {
-    Result current;
-    float lowestDistance = -1;
-    bool foundMatch;
-    for auto obj <- list {
-      if (obj.collide(ray, &current)) {
-        if (lowestDistance < 0 || current.distance < lowestDistance) {
-          lowestDistance = current.distance;
-          *res = current;
-          foundMatch = true;
-        }
+class LightStep : CommandHandler {
+  vec3f* lightpos;
+  void init(vec3f* lp) { lightpos = lp; }
+  void process(VMState[] list) {
+    fast_light_process(list.ptr, list.length, lightpos, void*:CommandHandler:this);
+    return;
+    for int i <- 0 .. list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      auto res = sp.result;
+      if (res.success) {
+        auto nspos = sp.ray.(pos + dir * (res.distance * 0.999));
+        // writeln "nspos = $(ray.(pos, dir)) @ $(res.distance) = $(nspos)";
+        using sp mixin(allocRay);
+        vec3f lightdir = ((*lightpos) - nspos).normalized;
+        sp.ray.(pos, dir) = (nspos, lightdir);
+      } else {
+        sp.stream = sp.stream[$-1 .. $]; // no point
       }
     }
-    return foundMatch;
-  }
-}
-
-class Sphere : SceneObject {
-  vec3f center;
-  float radius;
-  void init(vec3f c, float r) { center = c; radius = r; }
-  bool collide(Ray* ray, Result* res) {
-    vec3f pos = ray.pos - center; // pretranslate so we can pretend that we're a sphere around the origin
-    float p = (2*pos*ray.dir).sum;
-    float q = ((pos*pos).sum - radius * radius);
-    
-    float inside = p*p/4 - q;
-    if (inside < 0) return false;
-    
-    float sq = sqrt inside,
-      k = -p/2,
-      k1 = k + sq,
-      k2 = k - sq;
-    if (k1 < 0) return false;
-    res.distance = [k1, k2][eval k2 > 0];
-    res.col = vec3f(1);
-    res.normal = ray.at res.distance - center #.normalize3f();
-    return true;
-  }
-}
-
-class Scale : SceneObject {
-  float factor;
-  SceneObject sup;
-  void init(float f, SceneObject so) (factor, sup) = (f, so);
-  bool collide(Ray* ray, Result* res) {
-    auto v = vec3f(factor);
-    Ray ray2 = void;
-    ray2.pos = ray.pos / v;
-    ray2.dir = ray.dir; // can't divide - must be normalized
-    if (sup.collide(&ray2, res)) {
-      res.distance *= factor; // do it here instead
-      return true;
-    } else return false;
-  }
-}
-
-class Translate : SceneObject {
-  vec3f vector;
-  SceneObject sup;
-  void init(vec3f v, SceneObject so) (vector, sup) = (v, so);
-  bool collide(Ray* ray, Result* res) {
-    Ray ray2 = void;
-    ray2.pos = ray.pos - vector;
-    ray2.dir = ray.dir;
-    return sup.collide(&ray2, res);
   }
 }
 
 import std.time;
+import c.fenv;
+extern(C) { void GC_disable(); void GC_gcollect(); void GC_enable(); }
+extern(C) int feenableexcept(int);
 void main() {
-  initBoehm debugMode => true;
-  screen(150, 150);
-  SceneObject scene;
-  using new Group {
-    list ~= new CheckerPattern(vec3f(0, 1, 0), vec3f(0, 0, 1), new Plane(vec3f(0, 1, 0), vec3f(0, 0, 0)));
-    list ~= new Translate(vec3f(0, 0, 5), new Scale(0.2, new CheckerPattern(vec3f(0, 1, 0), vec3f(1, 0, 0), new Sphere(vec3f(0, 0, 0), 10))));
-    scene = that;
-  }
-  vec3f[] resbuffer = new vec3f[] (display.w * display.h);
-  float desired-fps = 30;
-  float lightrot = 0;
-  auto start = sec();
-  int iters;
-  (int, int) desired-display-size = display.(w, h);
-  
-  void render(int yfrom, yto) {
-    vec3f lightpos = vec3f(sin(lightrot) * 10 - 5, 5, cos(lightrot) * 10);
-    (int dw, int dh) = desired-display-size;
-    for (int y, int x) <- cross(yfrom..yto, 0..dw) {
-      float fx = x / (display.w/2f) - 1f, fy = 1f - y / (display.h/2f);
-      Ray ray = void;
-      ray.(pos, dir) = (vec3f(0, 2, 0), normalize3f vec3f(fx, fy, 1));
-      Result res = void;
-      if (scene.collide(&ray, &res)) {
-        auto nspos = ray.at (res.distance * 0.99);
-        // writeln "nspos = $(ray.(pos, dir)) @ $(res.distance) = $(nspos)";
-        Result res2 = void;
-        Ray lightray = void;
-        vec3f lightdir = lightpos - nspos;
-        lightray.pos = nspos;
-        lightray.dir = normalize3f lightdir;
-        // writeln "lightray is $(lightray.(pos, dir))";
-        float lightdist = |lightdir|;
-        float lightangle = (lightdir / lightdist) * res.normal #.sum;
-        if (scene.collide(&lightray, &res2) && res2.distance < lightdist || lightangle < 0) {
-          resbuffer[y * dw + x] = vec3f(0);
-        } else {
-          resbuffer[y * dw + x] = res.col * lightangle;
-        }
-      } else {
-        resbuffer[y * dw + x] = vec3f(0);
-      }
+  void check() {
+    if (!(mxcsr & (1 << 15))) {
+      writeln "Oops! FTZ has gotten 0. Resetting. $(mxcsr)";
+      // _interrupt 3;
+      mxcsr |= (3 << 13) | (1 << 15);
+      for auto val <- [FE_DIVBYZERO, FE_INVALID, FE_OVERFLOW]
+        feenableexcept val;
     }
   }
-  alias nums = 4; // number of subdivisions
-  auto tp = new ThreadPool nums;
+  for auto val <- [FE_DIVBYZERO, FE_INVALID, FE_OVERFLOW]
+    feenableexcept val;
+  initBoehm debugMode => true;
+  auto surf = screen(150, 150, surface => true);
+  
+  onResize = delegate void(int w, int h) {
+    screen(w, h, flags => SDL_OPENGL | SDL_RESIZABLE);
+  };
+  onResize(800, 800);
+  
+  SceneObject scene;
+  SceneObject teapot;
+  using new TriangleSet {
+    auto obj = string: readAll "teapot.obj" #.split "\n";
+    string[] selectAs(string delegate(string) dg) {
+      string[auto~] res;
+      for auto line <- obj if auto thing = dg line res ~= thing;
+      return res[];
+    }
+    auto vertices = [for array <- [for v <- selectAs(delegate string(string s) return s.startsWith "v ";): [for part <- v.split " ": std.string.atof part].eval[]]: vec3f(array[(0, 1, 2)])].eval[];
+    auto polys = [for v <- selectAs(delegate string(string s) return s.startsWith "f ";): v.split " "];
+    for auto poly <- polys if (poly.length == 4) {
+      auto indices = [for id <- [for part <- poly: part.split "/" #[0]]: vertices[std.string.atoi id - 1]].eval[];
+      addTriangle indices[(0, 1, 2)];
+      addTriangle indices[(0, 2, 3)];
+    }
+    // writeln "$(infos.length) tris. ";
+    writeln "aabb = $(that.aabb.a), $(that.aabb.b)";
+    optimize;
+    writeln "Tree optimized";
+    teapot = that;
+  }
+  using new Group {
+    // list ~= new CheckerPattern(vec3f(0, 1, 0), vec3f(0, 0, 1), new Plane(vec3f(0, 1, 0), vec3f(0, 0, 0)));
+    // list ~= new Translate(vec3f(0, 0, 5), new Scale(0.2, new CheckerPattern(vec3f(0, 1, 0), vec3f(1, 0, 0), new Sphere(vec3f(0, 0, 0), 10))));
+    // list ~= new Translate(vec3f(0, 0, 5), new Scale(2.5, new Triangle(vec3f(-1, 0.1, -1), vec3f(-1, 0.1, 1), vec3f(1, 0.1, -1))));
+    list ~= new Translate(vec3f(0, 0, 5), new Scale(1/30.0, teapot));
+    scene = that;
+  }
+  
+  vec3f lightpos;
+  
+  VMStats stats;
+  auto stream = scene.buildCommandStream(&stats);
+  stream = stream ~ new LightStep(&lightpos) ~ stream;
+  stream ~= CommandHandler: null; // terminator
+  int rays-needed = stats.rays-needed-max * 2 + 1;
+  int results-needed = stats.results-needed-max * 2;
+  writeln "($rays-needed, $results-needed): $(stream[0..$-1])";
+  
+  vec3f[] resbuffer = new vec3f[] (surf.w * surf.h);
+  float desired-fps = 1;
+  float lightrot = 0;
+  alias threads = 6; // number of subdivisions
+  auto start = sec();
+  int iters;
+  (int, int) desired-display-size = surf.(w, h);
+  
+  auto vm-map = new VMState[][] threads;
+  void render(int thread, int yfrom, yto) {
+    lightpos = vec3f(sin(lightrot) * 10 - 5, 5, cos(lightrot) * 10);
+    (int dw, int dh) = desired-display-size;
+    alias my-map = vm-map[thread];
+    int desired-length = (yto - yfrom) * dw;
+    if (my-map.length != desired-length) {
+      my-map = new VMState[] desired-length;
+    }
+    // split into subfunctions for the benefit of the profiler.
+    void setup() {
+      auto state = &my-map[0];
+      auto xstream = stream;
+      int resn = results-needed, rayn = rays-needed;
+      // prealloc results and rays
+      int count = (yto - yfrom) * dw;
+      Ray[] ray-slab;
+      Result[] res-slab;
+      for (int y, int x) <- cross(yfrom..yto, 0..dw) {
+        // float fx = x / (dw/2f) - 1f, fy = 1f - y / (dh/2f);
+        using state {
+          // result-id = 0;
+          // ray-id = 1;
+          if (result-stack.length != resn) {
+            if (!res-slab.length) res-slab = new Result[] (count * resn);
+            (result-stack, res-slab) = res-slab[(0 .. resn, resn .. $)];
+          }
+          if (ray-stack.length != rayn) {
+            if (!ray-slab.length) ray-slab = new Ray[] (count * rayn);
+            (ray-stack, ray-slab) = ray-slab[(0 .. rayn, rayn .. $)];
+          }
+          // auto dir = vec3f(fx, fy, 1);
+          // dir /= vec3f(|dir|);
+          // ray.pos = vec3f(0, 2, 0);
+          // ray.dir = dir;
+          stream = xstream;
+        }
+        state ++;
+      }
+      fastsetup(yfrom, yto, dw, dh, &my-map[0]);
+    }
+    void process() {
+      check;
+      auto rayqueue = my-map;
+      do {
+        while (rayqueue.length && !rayqueue[0].handler) rayqueue = rayqueue[1 .. $];
+      } while (rayqueue.length) {
+        auto hdl = rayqueue[0].handler;
+        hdl.process rayqueue;
+      }
+    }
+    void finalize() {
+      auto my-resbuffer = resbuffer[yfrom * dw .. yto * dw];
+      auto state = &my-map[0];
+      auto resptr = my-resbuffer.ptr;
+      for int i  <- 0 .. my-map.length {
+        auto res = &state.result-stack[0];
+        if (!res.success) *resptr = vec3f(0);
+        else {
+          // TODO: vec3f(x) should always lvize x!
+          auto res2 = &state.result-stack[1];
+          auto ray = &state.ray-stack[0];
+          float scaled-dist = res.distance * 0.99;
+          vec3f lightdir = lightpos - (ray.pos + ray.dir * vec3f(scaled-dist));
+          float lightdist = |lightdir|;
+          lightdir = lightdir.normalized;
+          // lightdir = lightdir / vec3f(lightdist);
+          vec3f lightprod = lightdir * res.normal;
+          float lightangle = lightprod.sum;
+          *resptr = vec3f(0);
+          if (lightangle >= 0 && (!res2.success || res2.distance >= lightdist)) {
+            *resptr = res.col * vec3f(lightangle);
+          }
+        }
+        state ++;
+        resptr ++;
+      }
+    }
+    setup();
+    process();
+    finalize();
+  }
+  
+  auto lp = new LoopPool threads;
   auto resbuffer-lock = new ReadWriteLock;
   
   bool stop;
@@ -185,28 +201,29 @@ void main() {
     auto last-printed = sec();
     while !stop {
       resbuffer-lock.lock-read();
-        for int i <- 0..nums {
-          auto rdg = &render;
-          tp.addTask new delegate void() { int step = display.h / nums; rdg(step * i, step * (i + 1)); };
-        }
-        tp.waitComplete;
+        auto rdg = &render;
+        auto ddsy = desired-display-size[1];
+        lp.runLoop(ddsy, delegate void(int line, int thr) { rdg(thr, line, line + 1); });
       resbuffer-lock.unlock();
       iters ++;
       // render();
       lightrot += 0.1;
-      auto delta = float:(sec() - start), fps = iters / delta;
+      auto delta = float:(sec() - start);
+      float fps;
+      if (delta > 0) fps = iters / delta;
+      else fps = 0.001; // eps
       // reconfigure window size to reach target fps
       float pixelfactor = desired-fps / fps, psq = sqrtf pixelfactor;
       float absf(float f) { if (f < 0) return -f; return f; }
       if (float:(sec() - last-printed) > 5) {
-        writeln "[fps $fps] [wanted $desired-fps] [res $desired-display-size] [speed $(display.(w*h) * iters / delta / 1_000_000)mrps]";
+        writeln "[fps $fps] [wanted $desired-fps] [res $desired-display-size] [speed $(surf.(w*h) * iters / delta / 1_000_000)mrps]";
         last-printed = sec();
       }
       if (absf (pixelfactor - 1) > 0.05 && delta > 1) {
         if (psq < 0.7) psq = 0.7;
-        (int, int) updated-size = (int:(display.w / psq), int:(display.h / psq));
-        desired-display-size = updated-size;
+        (int, int) updated-size = (int:(surf.w / psq), int:(surf.h / psq));
         resbuffer-lock.lock-write();
+          desired-display-size = updated-size;
           resbuffer.free;
           resbuffer = new vec3f[] (updated-size[0] * updated-size[1]);
         resbuffer-lock.unlock();
@@ -224,20 +241,49 @@ void main() {
     waitComplete;
     return;
   }
+  auto begin = sec();
   while (true) {
     auto start-draw = sec();
     resbuffer-lock.lock-read();
-      for (int y, int x) <- cross(0..display.h, 0..display.w) {
-        display.pset(x, y, resbuffer[y * display.w + x]);
+      for (int y, int x) <- cross(0..surf.h, 0..surf.w) {
+        surf.pset(x, y, resbuffer[y * desired-display-size[0] + x]);
       }
     resbuffer-lock.unlock();
+    surf.surf.flip;
+    mode GL {
+      Viewport (0, 0, display.(w, h));
+      int tex;
+      GenTextures(1, &tex);
+      MatrixMode PROJECTION;
+      LoadIdentity;
+      MatrixMode MODELVIEW;
+      LoadIdentity;
+      using TEXTURE_2D {
+        Enable;
+        BindTexture tex;
+        TexParameteri(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        TexImage2D (0, 3, surf.(w, h), 0, GL_BGRA, GL_UNSIGNED_BYTE, surf.surf.back.pixels);
+      }
+      ClearColor (1, 0, 0, 0);
+      Clear (COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT);
+      
+      using Quads {
+        Vertex2f( 1, -1); TexCoord2f(0, 0);
+        Vertex2f( 1,  1); TexCoord2f(1, 0);
+        Vertex2f(-1,  1); TexCoord2f(1, 1);
+        Vertex2f(-1, -1); TexCoord2f(0, 1);
+      }
+      Flush;
+      DeleteTextures(1, &tex);
+    }
+    SDL_GL_SwapBuffers();
     flip;
     auto end-draw = sec();
     auto should-take = 1f / desired-fps, delta = should-take-end-draw+start-draw /* abusive */;
     if (should-take > 0)
       sleep should-take;
-    if (display.(w != desired-display-size[0] || h != desired-display-size[1])) {
-      screen desired-display-size;
+    if (surf.(w != desired-display-size[0] || h != desired-display-size[1])) {
+      surf = screen (desired-display-size, surface => true);
     }
   }
 }

@@ -1,0 +1,275 @@
+module scene.triangle;
+
+import scene.base;
+
+bool rayHitsAABB(vec3f a, vec3f b, vec3f pos, vec3f dir) {
+  for int i <- 0..3
+    if (dir[i] < 0) { float _o = a[i]; a[i] = -b[i]; b[i] = -_o; pos[i] = -pos[i]; dir[i] = -dir[i]; }
+  
+  // pretend ray starts at origin
+  a -= pos;
+  b -= pos;
+  if (b.x < 0 || b.y < 0 || b.z < 0) return false; // ray is pointed away from aabb.
+  // multiply every component with dir.(x*y*z)
+  // vec3f dista = a / dir, distb = b / dir;
+  vec3f mulfac = vec3f(dir.(y * z, x * z, x * y));
+  vec3f dista = a * mulfac, distb = b * mulfac;
+  
+  float entry = max(dista.x, max(dista.y, dista.z));
+  float exit = min(distb.x, min(distb.y, distb.z));
+  if (entry <= exit) return true;
+  return false;
+}
+
+class Triangle : SceneObject {
+  vec3f a, ba, ca, n;
+  void init(vec3f a, b, c) {
+    this.(a, ba, ca) = (a, b - a, c - a);
+    n = vec3f(
+      ba.y*ca.z - ba.z*ca.y,
+      ba.z*ca.x - ba.x*ca.z,
+      ba.x*ca.y - ba.y*ca.x
+    );
+  }
+  bool collide(Ray* ray, Result* res) {
+    vec3f normal = n.normalized;
+    float dist = -(normal * (ray.pos - a)).sum / (ray.dir * normal).sum;
+    if (dist < 0) return false;
+    auto p = ray.pos + ray.dir * dist;
+    // thanks, http://www.blackpawn.com/texts/pointinpoly/default.html !
+    xmm[4] = ca;
+    xmm[5] = ba;
+    xmm[6] = p - a;
+    alias v0 = xmm[4], v1 = xmm[5], v2 = xmm[6];
+    float
+      dot00 = v0 * v0 #.sum,
+      dot01 = v0 * v1 #.sum,
+      dot02 = v0 * v2 #.sum,
+      dot11 = v1 * v1 #.sum,
+      dot12 = v1 * v2 #.sum;
+    float invDenom = 1 / (dot00 * dot11 - dot01 * dot01);
+    float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
+    float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
+    if (u < 0 || v < 0 || u+v > 1) return false;
+    res.distance = dist;
+    res.col = vec3f(1);
+    res.normal = normal;
+    return true;
+  }
+  void process(VMState[] list) {
+    vec3f normal = n.normalized;
+    xmm[4] = ca;
+    xmm[5] = ba;
+    alias v0 = vec3f:xmm[4], v1 = vec3f:xmm[5];
+    float
+      dot00 = v0 * v0 #.sum,
+      dot01 = v0 * v1 #.sum,
+      dot11 = v1 * v1 #.sum;
+    float invDenom = 1 / (dot00 * dot11 - dot01 * dot01);
+    
+    for (int i = 0; i < list.length; ++i) {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      auto pos = sp.ray.pos, dir = sp.ray.dir;
+      using sp mixin(allocResult);
+      auto res = sp.result;
+      
+      float dist = -(normal * (pos - a)).sum / (dir * normal).sum;
+      if (dist < 0) res.success = false;
+      else {
+        auto p = pos + dist * dir;
+        
+        xmm[6] = p - a;
+        alias v2 = vec3f:xmm[6];
+        
+        float
+          dot02 = v0 * v2 #.sum,
+          dot12 = v1 * v2 #.sum;
+        
+        float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
+        float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
+        // writeln "$u, $v";
+        
+        if (u > 0 && v > 0 && u + v < 1) {
+          res.(success, distance, col, normal)
+            = (true,    dist,vec3f(1), normal);
+        } else {
+          res.success = false;
+        }
+      }
+    }
+  }
+  CommandHandler[] buildCommandStream(VMStats* stats) {
+    stats.results-needed-cur ++;
+    return CommandHandler[]:null ~ this;
+  }
+}
+
+struct TriangleInfo {
+  vec3f a, b, c, n;
+}
+
+struct AABB {
+  vec3f a, b;
+  bool inited;
+  void addPoint(vec3f v) {
+    if (!inited) {
+      a = v; b = v;
+      inited = true;
+    } else {
+      for int i <- 0..3 {
+        a[i] = min(a[i], v[i]);
+        b[i] = max(b[i], v[i]);
+      }
+    }
+  }
+  bool rayHits(vec3f pos, vec3f dir) {
+    return rayHitsAABB(a, b, pos, dir);
+  }
+}
+
+struct TriangleNode {
+  TriangleNode* left, right;
+  TriangleInfo[auto~] info;
+  AABB aabb;
+  void addTriangle(TriangleInfo* ti) {
+    info ~= *ti;
+    aabb.addPoint ti.a;
+    aabb.addPoint ti.b;
+    aabb.addPoint ti.c;
+  }
+  TriangleNode* trySplitTris(int axis) {
+    auto res = new TriangleNode;
+    res.aabb = aabb;
+    
+    auto left = new TriangleNode, right = new TriangleNode;
+    res.left = left; res.right = right;
+    
+    auto marker = aabb.(a[axis] + (b[axis] - a[axis]) * 0.5);
+    for auto tri <- [for i <- 0..info.length: &info[i]] {
+      if (tri.a[axis] < marker || tri.b[axis] < marker || tri.c[axis] < marker)
+        left.addTriangle tri;
+      if (tri.a[axis] >= marker || tri.b[axis] >= marker || tri.c[axis] >= marker)
+        right.addTriangle tri;
+    }
+    return res;
+  }
+  TriangleNode* split(int verboseLevels = 0) {
+    TriangleNode* x 3 tns;
+    tns[0] = trySplitTris(0);
+    tns[1] = trySplitTris(1);
+    tns[2] = trySplitTris(2);
+    
+    int x 3 perf;
+    for int i <- 0..3 {
+      // writeln "$i -- tns[$i] = $(tns[i]), left = $(tns[i].left), length = $(tns[i].left.info.length), right = $(tns[i].right), length = $(tns[i].right.info.length)";
+      // optimizer bug here
+      perf[i] = tns[i].left.info.length + tns[i].right.info.length;
+      // writeln "mew. ";
+    }
+    
+    auto il = info.length;
+    int bestChoice = -1;
+    if (tns[0].(left.info.length != il && right.info.length != il)) bestChoice = 0;
+    if (tns[1].(left.info.length != il && right.info.length != il) && (bestChoice == -1 || perf[1] < perf[bestChoice]))
+      bestChoice = 1;
+    if (tns[2].(left.info.length != il && right.info.length != il) && (bestChoice == -1 || perf[2] < perf[bestChoice]))
+      bestChoice = 2;
+    if (bestChoice == -1) return &this;
+    auto res = tns[bestChoice];
+    auto nvlevels = verboseLevels - 1;
+    if (nvlevels < 0) nvlevels = 0;
+    if (verboseLevels > 0) writeln "$verboseLevels: recurse left";
+    res.left  = res.left .split(nvlevels);
+    if (verboseLevels > 0) writeln "$verboseLevels: recurse right";
+    res.right = res.right.split(nvlevels);
+    if (verboseLevels > 0) writeln "$verboseLevels: complete";
+    return res;
+  }
+}
+
+class TriangleSet : SceneObject {
+  TriangleNode* root;
+  AABB aabb;
+  void init() { root = new TriangleNode; }
+  void addTriangle(vec3f a, vec3f b, vec3f c) {
+    TriangleInfo ti;
+    aabb.addPoint a; aabb.addPoint b; aabb.addPoint c;
+    ti.(a, b, c) = (a, b, c);
+    auto ba = b - a, ca = c - a;
+    ti.n = ti.(vec3f(
+      ba.y*ca.z - ba.z*ca.y,
+      ba.z*ca.x - ba.x*ca.z,
+      ba.x*ca.y - ba.y*ca.x
+    ));
+    ti.n = -ti.n.normalized;
+    root.addTriangle &ti;
+  }
+  void optimize() {
+    root = root.split(2);
+  }
+  bool collide(Ray* ray, Result* res) { _interrupt 3; }
+  void process(VMState[] list) {
+    for (int i = 0; i < list.length; ++i) {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      auto pos = sp.ray.pos, dir = sp.ray.dir;
+      
+      if aabb.rayHits(pos, dir)::
+      
+      float closest; TriangleInfo* closest-info;
+      void recurse(TriangleNode* node) {
+        if (node.left) {
+          if (node.left .aabb.rayHits(pos, dir)) recurse(node.left );
+          if (node.right.aabb.rayHits(pos, dir)) recurse(node.right);
+        } else {
+          auto list = node.info[];
+          for auto ti <- [for i <- 0..list.length: &list[i]] {
+            auto normal = ti.n, a = ti.a;
+            float dist = -(normal * (pos - a)).sum / (dir * normal).sum;
+            if (dist < 0) return;
+            if (closest-info && closest < dist) return; // no point
+            auto p = pos + dist * dir;
+            xmm[4] = ti.c - a;
+            xmm[5] = ti.b - a;
+            xmm[6] =    p - a;
+            alias v0 = xmm[4], v1 = xmm[5], v2 = xmm[6];
+            float
+              dot00 = v0 * v0 #.sum,
+              dot01 = v0 * v1 #.sum,
+              dot02 = v0 * v2 #.sum,
+              dot11 = v1 * v1 #.sum,
+              dot12 = v1 * v2 #.sum;
+            
+            float invDenom = 1 / (dot00 * dot11 - dot01 * dot01);
+            float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
+            float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
+            if (u < 0 || v < 0 || u+v > 1) return;
+            closest-info = ti;
+            closest = dist;
+          }
+        }
+      }
+      recurse root;
+      
+      using sp mixin(allocResult);
+      auto res = sp.result;
+      
+      if (!closest-info) res.success = false;
+      else {
+        res.(success, distance, col,      normal)
+          = (true,    closest,  vec3f(1), closest-info.n);
+      }
+    }
+  }
+  CommandHandler[] buildCommandStream(VMStats* stats) {
+    stats.results-needed-cur ++;
+    return CommandHandler[]:null ~ this;
+  }
+}

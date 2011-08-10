@@ -165,10 +165,7 @@ struct TriangleNode {
     
     int x 3 perf;
     for int i <- 0..3 {
-      // writeln "$i -- tns[$i] = $(tns[i]), left = $(tns[i].left), length = $(tns[i].left.info.length), right = $(tns[i].right), length = $(tns[i].right.info.length)";
-      // optimizer bug here
       perf[i] = tns[i].left.info.length + tns[i].right.info.length;
-      // writeln "mew. ";
     }
     
     auto il = info.length;

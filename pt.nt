@@ -249,7 +249,6 @@ void main() {
         surf.pset(x, y, resbuffer[y * desired-display-size[0] + x]);
       }
     resbuffer-lock.unlock();
-    surf.surf.flip;
     mode GL {
       Viewport (0, 0, display.(w, h));
       int tex;
@@ -264,7 +263,7 @@ void main() {
         TexParameteri(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         TexImage2D (0, 3, surf.(w, h), 0, GL_BGRA, GL_UNSIGNED_BYTE, surf.surf.back.pixels);
       }
-      ClearColor (1, 0, 0, 0);
+      ClearColor (1, 1, 0, 0);
       Clear (COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT);
       
       using Quads {
@@ -276,6 +275,7 @@ void main() {
       Flush;
       DeleteTextures(1, &tex);
     }
+    surf.surf.flip;
     SDL_GL_SwapBuffers();
     flip;
     auto end-draw = sec();

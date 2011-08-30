@@ -1,0 +1,73 @@
+module scene.util;
+
+import scene.base;
+
+class AverageStep : CommandHandler {
+  int count;
+  void init(int c) { count = c; }
+  void process(VMState[] list) {
+    float factor = 1f / count;
+    for int i <- 0 .. list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      auto res1 = &sp.(result-stack[result-id - 2]), res2 = sp.result;
+      vec3f ecol1 = vec3f(0), ecol2 = vec3f(0);
+      if (res1.success) ecol1 = res1.emissive-color;
+      if (res2.success) ecol2 = res2.emissive-color;
+      res1.success |= res2.success;
+      res1.emissive-color = ecol1 + ecol2 * factor;
+      using sp mixin(freeResult.replace("!!", "1"));
+    }
+  }
+}
+
+class AllocEmptyResult : CommandHandler {
+  void process(VMState[] list) {
+    for int i <- 0 .. list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      using sp mixin(allocResult);
+      sp.result.success = false;
+    }
+  }
+}
+
+class AverageResults : SceneObject {
+  SceneObject sup;
+  int count;
+  void init(int count, SceneObject sup) this.(sup, count) = (sup, count);
+  CommandHandler[] buildCommandStream(VMStats* stats) {
+    stats.results-needed-cur ++;
+    auto stream = sup.buildCommandStream(stats);
+    stats.results-needed-cur --;
+    
+    auto as = new AverageStep count;
+    
+    CommandHandler[auto~] res;
+    res ~= new AllocEmptyResult;
+    for (int i = 0; i < count; ++i) {
+      res ~= stream;
+      res ~= as;
+    }
+    return res[];
+  }
+}
+
+class FreeRay : CommandHandler {
+  void process(VMState[] list) {
+    for int i <- 0 .. list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      using sp mixin(freeRay.replace("!!", "1"));
+    }
+  }
+}

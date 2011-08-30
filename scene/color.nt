@@ -1,0 +1,25 @@
+module scene.color;
+
+import scene.base;
+
+class Color : SceneObject {
+  SceneObject sup;
+  vec3f col;
+  void init(vec3f col, SceneObject so) { sup = so; this.col = col; }
+  bool collide(Ray* ray, Result* res) { raise-error new Error "Color::collide not implemented! "; }
+  void process(VMState[] list) {
+    for int i <- 0..list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      auto res = sp.result;
+      res.emissive-color = col;
+      res.reflective-color = vec3f(0);
+    }
+  }
+  CommandHandler[] buildCommandStream(VMStats* stats) {
+    return sup.buildCommandStream(stats) ~ this;
+  }
+}

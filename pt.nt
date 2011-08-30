@@ -1,10 +1,12 @@
 module pt;
 
-import sdl, opengl, std.math, std.thread, std.boehm, std.file, std.string;
+import sdl, opengl, std.math, std.thread, std.file, std.string;
+import std.boehm;
 
 import
   scene.checkerpattern, scene.group, scene.plane, scene.scale,
-  scene.sphere, scene.translate, scene.triangle, scene.base;
+  scene.sphere, scene.translate, scene.triangle, scene.util,
+  scene.color, scene.base;
 
 extern(C) {
   void fastsetup(int yfrom, yto, dw, dh, VMState*);
@@ -13,10 +15,41 @@ extern(C) {
 
 class LightStep : CommandHandler {
   vec3f* lightpos;
-  void init(vec3f* lp) { lightpos = lp; }
+  int numBasicSteps;
+  void init(vec3f* lp, int n) { lightpos = lp; numBasicSteps = n; }
+  class LightMergeStep : CommandHandler {
+    void process(VMState[] list) {
+      for int i <- 0 .. list.length {
+        auto sp = &list[i];
+        
+        if (void*:sp.handler == void*:CommandHandler:this)::
+        sp.stream = sp.stream[1..$];
+        
+        auto res = &sp.(result-stack[result-id - 2]);
+        if (res.success) {
+          vec3f lightdir = (*lightpos) - sp.ray.pos;
+          float lightdist = |lightdir|;
+          lightdir = lightdir.normalized;
+          vec3f lightprod = lightdir * res.normal;
+          float lightangle = lightprod.sum;
+          
+          vec3f resv = vec3f(0);
+          auto res2 = sp.result;
+          if (lightangle >= 0 && (!res2.success || res2.distance >= lightdist))
+            resv = res.reflective-color * vec3f(lightangle);
+          
+          res.emissive-color += resv;
+        }
+        using sp mixin(freeResult.replace("!!", "1"));
+        using sp mixin(freeRay.replace("!!", "1"));
+      }
+    }
+  }
+  LightMergeStep mkMergeStep() { return new LightMergeStep; }
   void process(VMState[] list) {
-    fast_light_process(list.ptr, list.length, lightpos, void*:CommandHandler:this);
-    return;
+    // TODO: rewrite
+    // fast_light_process(list.ptr, list.length, lightpos, void*:CommandHandler:this);
+    // return;
     for int i <- 0 .. list.length {
       auto sp = &list[i];
       
@@ -26,120 +59,376 @@ class LightStep : CommandHandler {
       auto res = sp.result;
       if (res.success) {
         auto nspos = sp.ray.(pos + dir * (res.distance * 0.999));
-        // writeln "nspos = $(ray.(pos, dir)) @ $(res.distance) = $(nspos)";
+        // writeln "nspos = $(sp.ray.(pos, dir)) @ $(res.distance) = $(nspos), lightpos $(*lightpos)";
         using sp mixin(allocRay);
         vec3f lightdir = ((*lightpos) - nspos).normalized;
         sp.ray.(pos, dir) = (nspos, lightdir);
       } else {
-        sp.stream = sp.stream[$-1 .. $]; // no point
+        using sp mixin(allocRay);
+        using sp mixin(allocResult);
+        sp.stream = sp.stream[numBasicSteps .. $]; // skip
       }
     }
   }
 }
 
-import std.time;
+import std.random;
+IRandom rng;
+float randf() { return std.random.base.randf(rng); }
+float Crandf(void* p) { auto backup = _esi; _esi = p; float res = std.random.base.randf(rng); _esi = backup; return res; }
+void init() {
+  rng = getPRNG(23);
+  auto dg = onThreadCreation;
+  onThreadCreation = new delegate void(void* basep) {
+    if (dg) { dg(basep); }
+    rng = getPRNG(int:basep);
+  };
+}
+
+vec3f rand_sphere() {
+  vec3f res;
+  do res = vec3f(randf() * 2 - 1 # x 3);
+  while |res| > 1 { }
+  return res;
+}
+
+class JitterRay : SceneObject {
+  vec2f delegate() scale;
+  SceneObject sup;
+  void init(vec2f delegate() s, SceneObject sup) { scale = s; this.sup = sup; }
+  void process(VMState[] list) {
+    auto sc = scale();
+    for int i <- 0 .. list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      auto ray = sp.ray;
+      using sp mixin(allocRay.replace("!!", "1"));
+      *sp.ray = *ray;
+      sp.ray.dir.x += randf() * sc.x;
+      sp.ray.dir.y += randf() * sc.y;
+    }
+  }
+  CommandHandler[] buildCommandStream(VMStats* stats) {
+    stats.rays-needed-cur ++;
+    auto stream = sup.buildCommandStream(stats);
+    stats.rays-needed-cur --;
+    return CommandHandler[]:null ~ this ~ stream ~ new FreeRay;
+  }
+}
+
+class PathTraceStep : CommandHandler {
+  int skip, res-delta;
+  void init(int s, int rd = 0) { skip = s; res-delta = rd; } 
+  class PathTraceMergeStep : CommandHandler {
+    void process(VMState[] list) {
+      for int i <- 0 .. list.length {
+        auto sp = &list[i];
+        
+        if (void*:sp.handler == void*:CommandHandler:this)::
+        sp.stream = sp.stream[1..$];
+        
+        auto res = &sp.(result-stack[result-id - 2]);
+        if (res.success) {
+          auto res2 = sp.result;
+          if (res2.success) {
+            res.emissive-color += res.reflective-color * res2.emissive-color;
+          }
+        }
+        using sp mixin(freeResult.replace("!!", "1"));
+      }
+    }
+  }
+  auto mkMergeStep() { return new PathTraceMergeStep; }
+  void process(VMState[] list) {
+    for int i <- 0 .. list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      using sp mixin(allocRay);
+      
+      auto res = sp.(result-stack[result-id - 1 - res-delta]);
+      if (res.success) {
+        auto nspos = sp.(ray-stack[ray-id - 2]).(pos + dir * (res.distance * 0.999));
+        // writeln "nspos = $(ray.(pos, dir)) @ $(res.distance) = $(nspos)";
+        sp.ray.(pos, dir) = (nspos, rand_sphere());
+        if (sp.ray.dir * res.normal).(x+y+z) < 1 sp.ray.dir = -sp.ray.dir;
+      } else {
+        using sp mixin(allocResult);
+        sp.stream = sp.stream[skip .. $]; // no point
+      }
+    }
+  }
+}
+
+alias atoi = std.string.atoi;
+
+class LightSource : SceneObject {
+  SceneObject sup;
+  vec3f* ls;
+  void init(vec3f* ls, SceneObject sup) this.(ls, sup) = (ls, sup);
+  CommandHandler[] buildCommandStream(VMStats* stats) {
+    stats.results-needed-cur ++;
+    stats.rays-needed-cur ++;
+    auto stream = sup.buildCommandStream(stats);
+    stats.results-needed-cur --;
+    stats.rays-needed-cur --;
+    using new LightStep(ls, stream.length)
+      return stream ~ that ~ stream ~ mkMergeStep();
+  }
+}
+
+class PathTraceLighting : SceneObject {
+  SceneObject sup, sup2; int avg;
+  void init(SceneObject sup) this.(sup, sup2, avg) = (sup, sup, 1);
+  void init(SceneObject sup, sup2) this.(sup, sup2, avg) = (sup, sup2, 1);
+  void init(int avg, SceneObject sup) this.(sup, sup2, avg) = (sup, sup, avg);
+  void init(int avg, SceneObject sup, sup2) this.(sup, sup2, avg) = (sup, sup2, avg);
+  CommandHandler[] buildCommandStream(VMStats* stats) {
+    auto stream = sup.buildCommandStream(stats);
+    
+    CommandHandler[auto~] res;
+    res ~= stream; // results ++
+    if (avg == 1) {
+      stats.rays-needed-cur ++;
+      auto stream2 = sup2.buildCommandStream(stats);
+      stats.rays-needed-cur --;
+      using new PathTraceStep(stream.length) {
+        res ~= that; // rays ++
+        res ~= stream2; // results ++
+        res ~= new FreeRay; // rays --
+        res ~= mkMergeStep(); // results --;
+      }
+      // summary: neutral
+    } else {
+      stats.rays-needed-cur ++;
+      stats.results-needed-cur ++;
+      auto stream2 = sup2.buildCommandStream(stats);
+      stats.results-needed-cur --;
+      stats.rays-needed-cur --;
+      auto pt = new PathTraceStep(stream.length, 1 /* skip one result (our empty averager) */);
+      auto fr = new FreeRay;
+      auto as = new AverageStep avg;
+      res ~= new AllocEmptyResult; // results ++
+      for (int i = 0; i < avg; ++i) {
+        res ~= pt; // rays ++
+        res ~= stream2; // results ++
+        res ~= fr; // rays --
+        res ~= as; // results --
+      }
+      res ~= pt.mkMergeStep(); // results --
+      // neutral
+    }
+    return res[];
+  }
+}
+
+import std.time, std.file;
 import c.fenv;
+import gd;
 extern(C) { void GC_disable(); void GC_gcollect(); void GC_enable(); }
 extern(C) int feenableexcept(int);
-void main() {
+void main(string[] args) {
+  (string exec, args) = args[(0, 1..$)];
+  bool break-on-float-errors = true;
   void check() {
     if (!(mxcsr & (1 << 15))) {
       writeln "Oops! FTZ has gotten 0. Resetting. $(mxcsr)";
       // _interrupt 3;
+      // rtz, fz
       mxcsr |= (3 << 13) | (1 << 15);
-      for auto val <- [FE_DIVBYZERO, FE_INVALID, FE_OVERFLOW]
-        feenableexcept val;
+      if (break-on-float-errors)
+        for auto val <- [FE_DIVBYZERO, FE_INVALID/*, FE_OVERFLOW .. infs are fine*/]
+          feenableexcept val;
     }
   }
-  for auto val <- [FE_DIVBYZERO, FE_INVALID, FE_OVERFLOW]
-    feenableexcept val;
-  initBoehm debugMode => true;
-  auto surf = screen(150, 150, surface => true);
+  initBoehm (debugMode => true);
   
   onResize = delegate void(int w, int h) {
-    screen(w, h, flags => SDL_OPENGL | SDL_RESIZABLE);
+    screen(w, h, flags => SDL_OPENGL | SDL_RESIZABLE | SDL_ANYFORMAT);
   };
-  onResize(800, 800);
   
   SceneObject scene;
-  SceneObject teapot;
+  SceneObject object;
   using new TriangleSet {
-    auto obj = string: readAll "teapot.obj" #.split "\n";
+    alias objfile = "hikone.obj";
+    auto obj = string: import(objfile) #.split "\n";
+    alias mtlfile = objfile.replace(".obj", ".mtl");
+    auto mtl = string: import(mtlfile) #.split "\n";
+    
+    (string, void*)[auto~] matcache;
+    void* lookupMatl(string matname) {
+      for (string name, void* data) <- matcache if name == matname return data;
+      bool inSection;
+      auto firstmatch = "newmtl $matname";
+      string fname;
+      for auto line <- mtl {
+        if (line.startsWith "newmtl ") {
+          inSection = false;
+          if (line == firstmatch) inSection = true;
+        }
+        
+        if (inSection && string rest = line.startsWith "map_Kd ") fname = rest;
+      }
+      if (!fname) {
+        writeln "No texture found for $matname! ";
+        return null;
+      } else {
+        auto fdata = readAll fname;
+        writeln "Read jpg: $matname => $fname ($$fdata.length bytes)";
+        auto data = gdImageCreateFromJpegPtr(fdata.(length, ptr));
+        if (data) writeln "($(data.sx), $(data.sy))";
+        matcache ~= (matname, void*:data);
+        return data;
+      }
+    }
+    
     string[] selectAs(string delegate(string) dg) {
       string[auto~] res;
       for auto line <- obj if auto thing = dg line res ~= thing;
       return res[];
     }
-    auto vertices = [for array <- [for v <- selectAs(delegate string(string s) return s.startsWith "v ";): [for part <- v.split " ": std.string.atof part].eval[]]: vec3f(array[(0, 1, 2)])].eval[];
-    auto polys = [for v <- selectAs(delegate string(string s) return s.startsWith "f ";): v.split " "];
-    for auto poly <- polys if (poly.length == 4) {
-      auto indices = [for id <- [for part <- poly: part.split "/" #[0]]: vertices[std.string.atoi id - 1]].eval[];
-      addTriangle indices[(0, 1, 2)];
-      addTriangle indices[(0, 2, 3)];
+    string[] selectOn(bool delegate(string) dg) {
+      string[auto~] res;
+      for auto line <- obj if dg line res ~= line;
+      return res[];
     }
+    vec3f vec3f_and_free(float[] array) { onSuccess array.free; return vec3f(array[(0, 1, 2)]); }
+    vec2f vec2f_and_free(float[] array) { onSuccess array.free; return vec2f(array[(0, 1)]); }
+    auto vertices = [for array <- [auto~for v <- selectAs(delegate string(string s) return s.startsWith "v ";): [auto~for part <- v.split " ": std.string.atof part].eval[]]: vec3f_and_free array].eval[];
+    auto texcoords = [for array <- [auto~for v <- selectAs(delegate string(string s) return s.startsWith "vt ";): [auto~for part <- v.split " ": std.string.atof part].eval[]]: vec2f_and_free array].eval[];
+    onSuccess { vertices.free; texcoords.free; }
+    auto fusemtl = selectOn(delegate bool(string s) return eval s.startsWith "f " || s.startsWith "usemtl "; );
+    void* currentTexture;
+    for auto line <- fusemtl {
+      if auto rest = line.startsWith "f " {
+        auto poly = rest.split " ";
+        if (poly.length > 2)::
+        auto tupAndFree(string[] st) { onSuccess st.free; return st[(0, 1)]; }
+        auto indices = [for
+          pair <- [for pair <- [for part <- poly: delegate auto(string[] st) { onSuccess st.free; return st[(0, 1)]; } part.split "/"]: (std.string.atoi pair[0] - 1, std.string.atoi pair[1] - 1)]:
+          (vertices[pair[0]], texcoords[pair[1]])
+        ].eval[];
+        for (int i = 2; i < poly.length; ++i)
+          // addTriangle indices[(0, i-1, i)];
+          addTriangle (indices[(0, i, i-1)], currentTexture);
+        indices.free;
+        poly.free;
+      }
+      if auto rest = line.startsWith "usemtl " {
+        currentTexture = lookupMatl rest;
+      }
+    }
+    obj.free;
     // writeln "$(infos.length) tris. ";
-    writeln "aabb = $(that.aabb.a), $(that.aabb.b)";
+    writeln "aabb = $(that.root.aabb.a), $(that.root.aabb.b)";
     optimize;
     writeln "Tree optimized";
-    teapot = that;
+    object = that;
   }
   using new Group {
     // list ~= new CheckerPattern(vec3f(0, 1, 0), vec3f(0, 0, 1), new Plane(vec3f(0, 1, 0), vec3f(0, 0, 0)));
+    list ~= new Scale(1/10.0, new CheckerPattern(vec3f(1, 0.95, 0.8), vec3f(0.8, 0.95, 1), new Plane(vec3f(0, 1, 0), vec3f(0, 0, 0))));
+    list ~= new Color(vec3f(0.2, 0.23, 0.3), new Plane(vec3f(0, -1, 0), vec3f(0, 100, 0)));
     // list ~= new Translate(vec3f(0, 0, 5), new Scale(0.2, new CheckerPattern(vec3f(0, 1, 0), vec3f(1, 0, 0), new Sphere(vec3f(0, 0, 0), 10))));
     // list ~= new Translate(vec3f(0, 0, 5), new Scale(2.5, new Triangle(vec3f(-1, 0.1, -1), vec3f(-1, 0.1, 1), vec3f(1, 0.1, -1))));
-    list ~= new Translate(vec3f(0, 0, 5), new Scale(1/30.0, teapot));
+    list ~= new Translate(vec3f(0, 1, 5), new Scale(1/30.0, object));
     scene = that;
   }
   
   vec3f lightpos;
   
-  VMStats stats;
-  auto stream = scene.buildCommandStream(&stats);
-  stream = stream ~ new LightStep(&lightpos) ~ stream;
-  stream ~= CommandHandler: null; // terminator
-  int rays-needed = stats.rays-needed-max * 2 + 1;
-  int results-needed = stats.results-needed-max * 2;
-  writeln "($rays-needed, $results-needed): $(stream[0..$-1])";
-  
-  vec3f[] resbuffer = new vec3f[] (surf.w * surf.h);
   float desired-fps = 1;
-  float lightrot = 0;
-  alias threads = 6; // number of subdivisions
-  auto start = sec();
-  int iters;
-  (int, int) desired-display-size = surf.(w, h);
+  for auto arg <- args if auto rest = arg.startsWith "-fps=" desired-fps = std.string.atof rest;
+  float lightrot = 1.43;
+  for auto arg <- args if auto rest = arg.startsWith "-lightrot=" lightrot = std.string.atof rest;
+  int threads = 6; // number of subdivisions
+  for auto arg <- args if auto rest = arg.startsWith "-threads=" threads = rest.atoi();
+  int samples = 1;
+  for auto arg <- args if auto rest = arg.startsWith "-samples=" samples = rest.atoi();
+  (int, int) imgres; // fixed-size single-pass render
+  for auto arg <- args if auto rest = arg.startsWith "-res=" using rest.split("x") imgres = (that[0].atoi(), that[1].atoi());
+  bool jitter;
+  for auto arg <- args if arg == "-jitter" jitter = true;
+  for auto arg <- args if arg == "-keep-going" break-on-float-errors = false;
+
+  if (break-on-float-errors)
+    for auto val <- [FE_DIVBYZERO, FE_INVALID/*, FE_OVERFLOW I said infs are fine >_>*/]
+      feenableexcept val;
   
-  auto vm-map = new VMState[][] threads;
+  scene = new LightSource(&lightpos, scene);
+  float ratio = 1;
+  if (imgres[0]) ratio = imgres[0] * 1f / imgres[1];
+  
+  (int, int) desired-display-size;
+  if (imgres[0] && imgres[1]) desired-display-size = imgres;
+  
+  vec2f getScale() {
+    return 2.0f * vec2f(ratio, 1) / vec2f(desired-display-size);
+  }
+  if (jitter) {
+    scene = new AverageResults(samples, new JitterRay(&getScale, new PathTraceLighting(scene, new PathTraceLighting (scene, new PathTraceLighting scene))));
+  } else {
+    scene = new PathTraceLighting(samples, scene, new PathTraceLighting (scene, new PathTraceLighting scene));
+  }
+  
+  vec3f[] resbuffer;
+  
+  VMStats stats;
+  stats.rays-needed-cur = 1;
+  stats.results-needed-cur = 0;
+  auto stream = scene.buildCommandStream(&stats);
+  stream ~= CommandHandler: null; // terminator
+  int rays-needed = stats.rays-needed-max;
+  int results-needed = stats.results-needed-max;
+  writeln "($rays-needed, $results-needed): $(stream[0..$-1])";
+  writeln "steps: $(stream.length - 1)";
+  
+  auto start = sec(), firststart = start;
+  int iters; long rays;
+  
+  auto ray-res-vm-map = new (Ray[], Result[], VMState[])[] threads;
+  void* align16(void* v) { return void*:(int:v + 15 #&-16); }
   void render(int thread, int yfrom, yto) {
     lightpos = vec3f(sin(lightrot) * 10 - 5, 5, cos(lightrot) * 10);
     (int dw, int dh) = desired-display-size;
-    alias my-map = vm-map[thread];
-    int desired-length = (yto - yfrom) * dw;
-    if (my-map.length != desired-length) {
-      my-map = new VMState[] desired-length;
-    }
+    alias my-ray-map = ray-res-vm-map[thread][0];
+    alias my-res-map = ray-res-vm-map[thread][1];
+    alias my-vm-map = ray-res-vm-map[thread][2];
     // split into subfunctions for the benefit of the profiler.
     void setup() {
-      auto state = &my-map[0];
       auto xstream = stream;
       int resn = results-needed, rayn = rays-needed;
-      // prealloc results and rays
+      // prealloc vm, results, rays
       int count = (yto - yfrom) * dw;
-      Ray[] ray-slab;
-      Result[] res-slab;
+      if (my-vm-map.length != count + 1) {
+        my-vm-map.free;
+        my-vm-map = new VMState[] (count + 1);
+      }
+      if (my-ray-map.length != count * rayn + 1) {
+        my-ray-map.free;
+        my-ray-map = new Ray[] (count*rayn + 1);
+      }
+      if (my-res-map.length != count * resn + 1) {
+        my-res-map.free;
+        my-res-map = new Result[] (count*resn + 1);
+      }
+      Ray[] ray-slab = Ray*:align16(my-ray-map.ptr) #[0..my-ray-map.length - 1];
+      Result[] res-slab = Result*:align16(my-res-map.ptr) #[0..my-res-map.length - 1];
+      auto state = VMState*:align16(my-vm-map.ptr);
       for (int y, int x) <- cross(yfrom..yto, 0..dw) {
         // float fx = x / (dw/2f) - 1f, fy = 1f - y / (dh/2f);
         using state {
           // result-id = 0;
           // ray-id = 1;
-          if (result-stack.length != resn) {
-            if (!res-slab.length) res-slab = new Result[] (count * resn);
-            (result-stack, res-slab) = res-slab[(0 .. resn, resn .. $)];
-          }
-          if (ray-stack.length != rayn) {
-            if (!ray-slab.length) ray-slab = new Ray[] (count * rayn);
-            (ray-stack, ray-slab) = ray-slab[(0 .. rayn, rayn .. $)];
-          }
+          result-stack = res-slab.ptr; res-slab = res-slab[resn .. $];
+             ray-stack = ray-slab.ptr; ray-slab = ray-slab[rayn .. $];
+          for auto i <- 0..resn
+            result-stack[i].emissive-color = vec3f(0);
           // auto dir = vec3f(fx, fy, 1);
           // dir /= vec3f(|dir|);
           // ray.pos = vec3f(0, 2, 0);
@@ -148,11 +437,11 @@ void main() {
         }
         state ++;
       }
-      fastsetup(yfrom, yto, dw, dh, &my-map[0]);
+      fastsetup(yfrom, yto, dw, dh, align16(&my-vm-map[0]));
     }
     void process() {
       check;
-      auto rayqueue = my-map;
+      auto rayqueue = VMState*:align16(my-vm-map.ptr) #[0..my-vm-map.length - 1];
       do {
         while (rayqueue.length && !rayqueue[0].handler) rayqueue = rayqueue[1 .. $];
       } while (rayqueue.length) {
@@ -162,26 +451,16 @@ void main() {
     }
     void finalize() {
       auto my-resbuffer = resbuffer[yfrom * dw .. yto * dw];
-      auto state = &my-map[0];
+      auto state = VMState*:align16(my-vm-map.ptr);
       auto resptr = my-resbuffer.ptr;
-      for int i  <- 0 .. my-map.length {
+      for int i  <- 0 .. my-vm-map.length - 1 {
         auto res = &state.result-stack[0];
         if (!res.success) *resptr = vec3f(0);
         else {
-          // TODO: vec3f(x) should always lvize x!
-          auto res2 = &state.result-stack[1];
-          auto ray = &state.ray-stack[0];
-          float scaled-dist = res.distance * 0.99;
-          vec3f lightdir = lightpos - (ray.pos + ray.dir * vec3f(scaled-dist));
-          float lightdist = |lightdir|;
-          lightdir = lightdir.normalized;
-          // lightdir = lightdir / vec3f(lightdist);
-          vec3f lightprod = lightdir * res.normal;
-          float lightangle = lightprod.sum;
-          *resptr = vec3f(0);
-          if (lightangle >= 0 && (!res2.success || res2.distance >= lightdist)) {
-            *resptr = res.col * vec3f(lightangle);
-          }
+          *resptr = res.emissive-color;
+          float maxf(float a, b) return [a, b][eval b > a];
+          if (resptr.(maxf(x, maxf(y, z))) > 1)
+            (*resptr) /= resptr.(maxf(x, maxf(y, z)));
         }
         state ++;
         resptr ++;
@@ -193,8 +472,47 @@ void main() {
   }
   
   auto lp = new LoopPool threads;
+  
+  if (imgres[0] && imgres[1]) {
+    resbuffer = new vec3f[] (imgres[0] * imgres[1]);
+    auto surf = screen(imgres, surface => true);
+    writeln "Calculate $(imgres). ";
+    bool done; int lines-done;
+    void save() {
+      auto gdp = gdImageCreateTrueColor(imgres);
+      onSuccess gdImageDestroy gdp;
+      for (int y, int x) <- cross(0..surf.h, 0..surf.w) {
+        // writeln "$x, $y: $(floatToIntColor resbuffer[y * desired-display-size[0] + x]) <= $(resbuffer[y * desired-display-size[0] + x])";#
+        gdp.tpixels[y][imgres[0] - 1 - x] = floatToIntColor resbuffer[y * imgres[0] + x];
+      }
+      auto hdl = fopen ("out.png", "w");
+      gdImagePng(gdp, c.gd.FILE*: hdl);
+      fclose hdl;
+    }
+    new ThreadPool 1 #.addTask delegate void() {
+      auto start = sec();
+      while !done {
+        auto t = sec(), delta = float:(t - start);
+        if (lines-done)
+          writeln "$(int:delta)s: $(lines-done * 100 #/imgres[1])% done, est. $(int:(delta * imgres[1] #/lines-done - delta))s left. ";
+        save();
+        sleep 1;
+      }
+    };
+    lp.runLoop(imgres[1], delegate void(int line, thr) { render(thr, line, line + 1); lines-done ++; });
+    done = true;
+    writeln "Save. ";
+    save();
+    return;
+  }
+  
   auto resbuffer-lock = new ReadWriteLock;
   
+  auto surf = screen(150, 150, surface => true);
+  desired-display-size = surf.(w, h);
+  resbuffer = new vec3f[] surf.(w * h);
+  
+  onResize(800, 800);
   bool stop;
   using new ThreadPool 1::
   addTask delegate void() {
@@ -203,12 +521,14 @@ void main() {
       resbuffer-lock.lock-read();
         auto rdg = &render;
         auto ddsy = desired-display-size[1];
-        lp.runLoop(ddsy, delegate void(int line, int thr) { rdg(thr, line, line + 1); });
+        lp.runLoop(ddsy, delegate void(int line, thr) { rdg(thr, line, line + 1); });
       resbuffer-lock.unlock();
       iters ++;
+      rays += surf.(w*h);
       // render();
-      lightrot += 0.1;
+      // lightrot += 0.1;
       auto delta = float:(sec() - start);
+      auto fulldelta = float:(sec() - firststart);
       float fps;
       if (delta > 0) fps = iters / delta;
       else fps = 0.001; // eps
@@ -216,7 +536,7 @@ void main() {
       float pixelfactor = desired-fps / fps, psq = sqrtf pixelfactor;
       float absf(float f) { if (f < 0) return -f; return f; }
       if (float:(sec() - last-printed) > 5) {
-        writeln "[fps $fps] [wanted $desired-fps] [res $desired-display-size] [speed $(surf.(w*h) * iters / delta / 1_000_000)mrps]";
+        writeln "[fps $fps] [wanted $desired-fps] [res $desired-display-size] [speed $(surf.(w*h) * iters / delta / 1_000_000)mrps] [full speed $(double:rays / fulldelta / 1_000_000)mrps]";
         last-printed = sec();
       }
       if (absf (pixelfactor - 1) > 0.05 && delta > 1) {
@@ -242,6 +562,9 @@ void main() {
     return;
   }
   auto begin = sec();
+  int tex;
+  glGenTextures(1, &tex);
+  onSuccess glDeleteTextures(1, &tex);
   while (true) {
     auto start-draw = sec();
     resbuffer-lock.lock-read();
@@ -251,8 +574,6 @@ void main() {
     resbuffer-lock.unlock();
     mode GL {
       Viewport (0, 0, display.(w, h));
-      int tex;
-      GenTextures(1, &tex);
       MatrixMode PROJECTION;
       LoadIdentity;
       MatrixMode MODELVIEW;
@@ -260,8 +581,9 @@ void main() {
       using TEXTURE_2D {
         Enable;
         BindTexture tex;
-        TexParameteri(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        TexImage2D (0, 3, surf.(w, h), 0, GL_BGRA, GL_UNSIGNED_BYTE, surf.surf.back.pixels);
+        TexParameteri(TEXTURE_MIN_FILTER, NEAREST);
+        TexParameteri(TEXTURE_MAG_FILTER, NEAREST);
+        TexImage2D (0, 3, surf.(w, h), 0, 0x80E1 /*BGRA*/, UNSIGNED_BYTE, surf.surf.back.pixels);
       }
       ClearColor (1, 1, 0, 0);
       Clear (COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT);
@@ -272,8 +594,6 @@ void main() {
         Vertex2f(-1,  1); TexCoord2f(1, 1);
         Vertex2f(-1, -1); TexCoord2f(0, 1);
       }
-      Flush;
-      DeleteTextures(1, &tex);
     }
     surf.surf.flip;
     SDL_GL_SwapBuffers();

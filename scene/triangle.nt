@@ -1,10 +1,53 @@
 module scene.triangle;
 
-import scene.base;
+import scene.base, gd;
 
-bool rayHitsAABB(vec3f a, vec3f b, vec3f pos, vec3f dir) {
-  for int i <- 0..3
-    if (dir[i] < 0) { float _o = a[i]; a[i] = -b[i]; b[i] = -_o; pos[i] = -pos[i]; dir[i] = -dir[i]; }
+void init() {
+  // auto file = import("teabake_tex.jpg");
+  // texptr = gdImageCreateFromJpegPtr(file.(length, ptr));
+  // auto file = import("testsurf.png");
+  // texptr = gdImageCreateFromPngPtr(file.(length, ptr));
+}
+
+vec3f lookup(int x, y, void* texptr) {
+  auto gdp = gdImagePtr:texptr;
+  int res = gdp.tpixels[y%gdp.sy][x%gdp.sx];
+  return vec3f((res>>16)&0xff, (res>>8)&0xff, (res>>0)&0xff) / 256;
+}
+
+vec3f interpolate(float u, v, void* texptr) {
+  auto gdp = gdImagePtr:texptr;
+  auto coord = vec2f(u, v) * vec2f(gdp.sx, gdp.sy);
+  auto icoord = vec2i(int:fastfloor coord.x, int:fastfloor coord.y);
+  auto pts = (lookup(icoord, texptr),         lookup(icoord+vec2i.Y,  texptr),
+              lookup(icoord+vec2i.X, texptr), lookup(icoord+vec2i(1), texptr));
+  auto facs = coord - vec2f(fastfloor coord.x, fastfloor coord.y);
+  return pts[0]*(1-facs.x)*(1-facs.y) + pts[1]*(1-facs.x)*facs.y + pts[2]*facs.x*(1-facs.y) + pts[3]*facs.x*facs.y;
+}
+
+bool rayHitsAABB(vec3f* ap, bp, pos-p, dir-p, (float, float)* dist = null) {
+  xmm[4] = *dir-p;
+  xmm[5] = *pos-p;
+  xmm[6] = *ap;
+  xmm[7] = *bp;
+  int i = 1 << 31;
+  asm "movd (%esp), %xmm3";
+  asm `shufps $0, %xmm3, %xmm3`;
+  asm "movaps %xmm4, %xmm2";
+  asm "andps %xmm3, %xmm2"; // select sign bits of dir
+  asm "xorps %xmm2, %xmm4"; // flip signs where negative
+  asm "xorps %xmm2, %xmm5";
+  asm "xorps %xmm2, %xmm6";
+  asm "xorps %xmm2, %xmm7";
+  asm "movaps %xmm6, %xmm2";
+  asm "movaps %xmm7, %xmm3";
+  asm "minps %xmm3, %xmm6"; // a = min(a, b);
+  asm "maxps %xmm2, %xmm7"; // b = max(a, b);
+  
+  auto dir = vec3f:xmm[4];
+  auto pos = vec3f:xmm[5];
+  auto a   = vec3f:xmm[6];
+  auto b   = vec3f:xmm[7];
   
   // pretend ray starts at origin
   a -= pos;
@@ -12,12 +55,15 @@ bool rayHitsAABB(vec3f a, vec3f b, vec3f pos, vec3f dir) {
   if (b.x < 0 || b.y < 0 || b.z < 0) return false; // ray is pointed away from aabb.
   // multiply every component with dir.(x*y*z)
   // vec3f dista = a / dir, distb = b / dir;
-  vec3f mulfac = vec3f(dir.(y * z, x * z, x * y));
+  vec3f mulfac = dir.yxx * dir.zzy;
   vec3f dista = a * mulfac, distb = b * mulfac;
   
   float entry = max(dista.x, max(dista.y, dista.z));
   float exit = min(distb.x, min(distb.y, distb.z));
-  if (entry <= exit) return true;
+  if (entry <= exit) {
+    if (dist) { *dist = (entry, dir.(x*y*z)); }
+    return true;
+  }
   return false;
 }
 
@@ -108,45 +154,111 @@ class Triangle : SceneObject {
   }
 }
 
-struct TriangleInfo {
+struct TriangleInfo { // ~100b
   vec3f a, b, c, n;
+  float dot00, dot01, dot11, invDenom;
+  vec2f uv-a, uv-ba, uv-ca; void* texture-state;
 }
+
+extern(C) int fast_rayHitsAABB(vec3f* abp, p_ray, float* dist);
 
 struct AABB {
   vec3f a, b;
-  bool inited;
+  void addInitialPoint(vec3f v) { 
+    a = v; b = v;
+  }
   void addPoint(vec3f v) {
-    if (!inited) {
-      a = v; b = v;
-      inited = true;
-    } else {
-      for int i <- 0..3 {
-        a[i] = min(a[i], v[i]);
-        b[i] = max(b[i], v[i]);
-      }
+    for int i <- 0..3 {
+      a[i] = min(a[i], v[i]);
+      b[i] = max(b[i], v[i]);
     }
   }
-  bool rayHits(vec3f pos, vec3f dir) {
-    return rayHitsAABB(a, b, pos, dir);
+  // can't use C fun
+  bool rayHits_unaligned(vec3f* pos-p, dir-p, (float, float)* dist = null) {
+    return rayHitsAABB(&a, &b, pos-p, dir-p, dist);
+  }
+  bool rayHits(vec3f* ray-p, (float, float)* dist = null) {
+    // return rayHitsAABB(&a, &b, pos-p, dir-p, dist);
+    float f;
+    auto res = fast_rayHitsAABB(&a, ray-p, &f);
+    if (dist) { *dist = (f, 1); }
+    return res;
   }
 }
 
+extern(C) int posix_memalign(void**, size_t, size_t);
+extern(C) void* GC_memalign(size_t, size_t);
+extern(C) void* memset(void*, int, int);
+void* aligned_calloc(int i) {
+  void* res;
+  // posix_memalign(&res, size_t:16, size_t:i);
+  res = GC_memalign(size_t:16, size_t:i);
+  memset(res, 0, i);
+  return res;
+}
+
+int round16(int i) { return (i + 15) &-16; }
+
 struct TriangleNode {
-  TriangleNode* left, right;
-  TriangleInfo[auto~] info;
   AABB aabb;
+  TriangleNode*[] children;
+  alias left = children[0], right = children[1];
+  
+  TriangleInfo[auto~] info;
+  // return void*:size if slab is null, res otherwise
+  void* linearAllocate(void** slabp = null) {
+    if (size-of TriangleInfo & 15) { writeln "WTF! :( $(size-of TriangleInfo) => $(size-of TriangleInfo & 15)"; _interrupt 3; }
+    alias slab = *slabp;
+    if (slabp) {
+      auto res = TriangleNode*:slab;
+      slab = void*:round16(int:slab + size-of TriangleNode);
+      res.aabb = aabb;
+      if (children.length) {
+        res.children = TriangleNode**:slab #[0..children.length];
+        slab = void*:round16(int:slab + children.length * size-of TriangleNode*);
+        for int i <- 0..children.length {
+          res.children[i] = children[i].linearAllocate &slab;
+        }
+      } else {
+        res.info = TriangleInfo*:slab #[0..info.length];
+        slab += info.length * size-of TriangleInfo;
+        for int i <- 0..info.length
+          res.info[i] = info[i];
+        info.free;
+      }
+      return res;
+    } else {
+      if (children.length) {
+        int s;
+        for auto ch <- children s += int:ch.linearAllocate();
+        return void*:(round16 size-of TriangleNode + round16 (children.length * size-of TriangleNode*) + s);
+      } else {
+        return void*:(round16 size-of TriangleNode + info.length * size-of TriangleInfo);
+      }
+    }
+  }
+  void free() {
+    if (children.length) { for auto ch <- children ch.free; }
+    else info.free;
+  }
   void addTriangle(TriangleInfo* ti) {
+    if (!info.length) aabb.addInitialPoint ti.a;
+    else aabb.addPoint ti.a;
+    
     info ~= *ti;
-    aabb.addPoint ti.a;
+    
     aabb.addPoint ti.b;
     aabb.addPoint ti.c;
   }
   TriangleNode* trySplitTris(int axis) {
-    auto res = new TriangleNode;
+    auto res = TriangleNode*:aligned_calloc size-of TriangleNode;
     res.aabb = aabb;
     
-    auto left = new TriangleNode, right = new TriangleNode;
-    res.left = left; res.right = right;
+    auto left = TriangleNode*:aligned_calloc size-of TriangleNode;
+    auto right = TriangleNode*:aligned_calloc size-of TriangleNode;
+    res.children = TriangleNode**:aligned_calloc (2 * size-of TriangleNode*) #[0..2];
+    res.children[0] = left;
+    res.children[1] = right;
     
     auto marker = aabb.(a[axis] + (b[axis] - a[axis]) * 0.5);
     for auto tri <- [for i <- 0..info.length: &info[i]] {
@@ -157,7 +269,7 @@ struct TriangleNode {
     }
     return res;
   }
-  TriangleNode* split(int verboseLevels = 0) {
+  TriangleNode* split() {
     TriangleNode* x 3 tns;
     tns[0] = trySplitTris(0);
     tns[1] = trySplitTris(1);
@@ -175,38 +287,78 @@ struct TriangleNode {
       bestChoice = 1;
     if (tns[2].(left.info.length != il && right.info.length != il) && (bestChoice == -1 || perf[2] < perf[bestChoice]))
       bestChoice = 2;
-    if (bestChoice == -1) return &this;
+    if (bestChoice == -1) { for int i <- 0..3 tns[i].free; return null; }
     auto res = tns[bestChoice];
+    for int i <- 0..3 if i != bestChoice tns[i].free;
+    return res;
+  }
+  void splitreplace(int verboseLevels = 0) {
+    auto res = split();
+    if (!res) return;
+    float eff = (info.length * 1f / (res.right.info.length + res.left.info.length)) - 0.5 #* 2f;
+    if (eff < 0.6) { res.free; return; } // not worth it? HEURISTIC. See perf.txt
+    // writeln "$(info.length) => $(left.info.length), $(right.info.length): efficiency of $(int:(eff*100))%";
+    children = res.children;
+    info.free;
     auto nvlevels = verboseLevels - 1;
     if (nvlevels < 0) nvlevels = 0;
     if (verboseLevels > 0) writeln "$verboseLevels: recurse left";
-    res.left  = res.left .split(nvlevels);
+    left .splitreplace(nvlevels);
     if (verboseLevels > 0) writeln "$verboseLevels: recurse right";
-    res.right = res.right.split(nvlevels);
+    right.splitreplace(nvlevels);
     if (verboseLevels > 0) writeln "$verboseLevels: complete";
-    return res;
   }
 }
 
+extern(C) void fast_triangle_recurse(TriangleNode *node, vec3f* pos, dir, TriangleInfo** closest_res, float* closest, vec2f* uv);
+
 class TriangleSet : SceneObject {
   TriangleNode* root;
-  AABB aabb;
   void init() { root = new TriangleNode; }
-  void addTriangle(vec3f a, vec3f b, vec3f c) {
+  void addTriangle(vec3f a, vec2f atex, vec3f b, vec2f btex, vec3f c, vec2f ctex, void* texptr) {
     TriangleInfo ti;
-    aabb.addPoint a; aabb.addPoint b; aabb.addPoint c;
-    ti.(a, b, c) = (a, b, c);
+    ti.(a, b, c, uv-a, uv-ba, uv-ca) = (a, b, c, atex, btex - atex, ctex - atex);
+    ti.texture-state = texptr;
     auto ba = b - a, ca = c - a;
     ti.n = ti.(vec3f(
       ba.y*ca.z - ba.z*ca.y,
       ba.z*ca.x - ba.x*ca.z,
       ba.x*ca.y - ba.y*ca.x
     ));
+    if (ti.n == vec3f(0)) ti.n = vec3f.Y;
     ti.n = -ti.n.normalized;
+    
+    // precompute
+    ti.dot00 = ca * ca #.sum;
+    ti.dot01 = ca * ba #.sum;
+    ti.dot11 = ba * ba #.sum;
+    float denom = ti.(dot00 * dot11 - dot01 * dot01);
+    if (denom != 0) ti.invDenom = 1 / denom;
+    else ti.invDenom = 1;
+    
     root.addTriangle &ti;
   }
   void optimize() {
-    root = root.split(2);
+    root.splitreplace(2);
+    // four children is always better than two assuming ray isn't a total miss
+    // ray is total miss: 2 tests => 4 tests
+    // ray hits one child: 2 tests + 2 at the next level = 4 tests => 4 tests
+    // ray hits both children: 2 tests + 4 at the next level = 6 tests => 4 tests
+    void two_to_four(TriangleNode* tnode) {
+      if (tnode.(children.length == 2 && children[0].children.length == 2 && children[1].children.length == 2)) {
+        auto newchildren = TriangleNode**:aligned_calloc (4 * size-of TriangleNode*) #[0..4];
+        for (int i1, (int i2, int i3)) <- zip(0..4, cross(0..2, 0..2))
+          newchildren[i1] = tnode.children[i2].children[i3];
+        tnode.children = newchildren;
+      }
+      for auto ch <- tnode.children two_to_four ch;
+    }
+    // may not be worth it .. test more?
+    // two_to_four root;
+    auto size = int:root.linearAllocate();
+    writeln "full slab size = $size";
+    void* ptr = aligned_calloc size;
+    root = TriangleNode*: root.linearAllocate(&ptr);
   }
   bool collide(Ray* ray, Result* res) { _interrupt 3; }
   void process(VMState[] list) {
@@ -216,52 +368,74 @@ class TriangleSet : SceneObject {
       if (void*:sp.handler == void*:CommandHandler:this)::
       sp.stream = sp.stream[1..$];
       
-      auto pos = sp.ray.pos, dir = sp.ray.dir;
-      
-      if aabb.rayHits(pos, dir)::
-      
-      float closest; TriangleInfo* closest-info;
-      void recurse(TriangleNode* node) {
-        if (node.left) {
-          if (node.left .aabb.rayHits(pos, dir)) recurse(node.left );
-          if (node.right.aabb.rayHits(pos, dir)) recurse(node.right);
-        } else {
-          auto list = node.info[];
-          for auto ti <- [for i <- 0..list.length: &list[i]] {
-            auto normal = ti.n, a = ti.a;
-            float dist = -(normal * (pos - a)).sum / (dir * normal).sum;
-            if (dist < 0) return;
-            if (closest-info && closest < dist) return; // no point
-            auto p = pos + dist * dir;
-            xmm[4] = ti.c - a;
-            xmm[5] = ti.b - a;
-            xmm[6] =    p - a;
-            alias v0 = xmm[4], v1 = xmm[5], v2 = xmm[6];
-            float
-              dot00 = v0 * v0 #.sum,
-              dot01 = v0 * v1 #.sum,
-              dot02 = v0 * v2 #.sum,
-              dot11 = v1 * v1 #.sum,
-              dot12 = v1 * v2 #.sum;
-            
-            float invDenom = 1 / (dot00 * dot11 - dot01 * dot01);
-            float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
-            float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
-            if (u < 0 || v < 0 || u+v > 1) return;
-            closest-info = ti;
-            closest = dist;
-          }
-        }
-      }
-      recurse root;
-      
       using sp mixin(allocResult);
       auto res = sp.result;
       
-      if (!closest-info) res.success = false;
-      else {
-        res.(success, distance, col,      normal)
-          = (true,    closest,  vec3f(1), closest-info.n);
+      res.success = false;
+      
+      auto pos = sp.ray.pos, dir = sp.ray.dir;
+      
+      float closest; TriangleInfo* closest-info;
+      vec2f texcoord;
+      void recurse(TriangleNode* node) {
+        if (node.left) {
+          if (closest-info) {
+            (float, float) fs;
+            alias fdist = fs[0] / fs[1];
+            if (node.left .aabb.rayHits(&pos, &fs) && fdist < closest) recurse(node.left );
+            if (node.right.aabb.rayHits(&pos, &fs) && fdist < closest) recurse(node.right);
+          } else {
+            if (node.left .aabb.rayHits(&pos)) recurse(node.left );
+            if (node.right.aabb.rayHits(&pos)) recurse(node.right);
+          }
+        } else {
+          auto trilist = node.info[];
+          for auto ti <- [for i <- 0..trilist.length: &trilist[i]] {
+            float dist = void;
+            {
+              float f1 = (ti.n * (pos - ti.a)).sum;
+              float f2 = (dir * ti.n).sum;
+              // dist = - f1 / f2
+              asm "movd (%esp), %xmm4";
+              asm "movd 4(%esp), %xmm5";
+              asm "xorps %xmm6, %xmm6";
+              asm "subss %xmm5, %xmm6";
+              asm "divss %xmm4, %xmm6";
+              asm "movd %xmm6, 8(%esp)";
+            }
+            if (dist > 0)::
+            if (!closest-info || dist < closest):: // no point otherwise
+            auto p = pos + vec3f(dist) * dir;
+            xmm[7] = ti.a;
+            xmm[4] = ti.c; xmm[4] -= xmm[7];
+            xmm[5] = ti.b; xmm[5] -= xmm[7];
+            xmm[6] =    p; xmm[6] -= xmm[7];
+            alias v0 = xmm[4], v1 = xmm[5], v2 = xmm[6];
+            float
+              dot02 = v0 * v2 #.sum,
+              dot12 = v1 * v2 #.sum;
+            alias dot00 = ti.dot00, dot01 = ti.dot01, dot11 = ti.dot11;
+            float invDenom = ti.invDenom;
+            
+            float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
+            float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
+            if (u >= 0 && v >= 0 && u+v <= 1) {
+              closest-info = ti;
+              closest = dist;
+              texcoord = vec2f(u, v);
+            }
+          }
+        }
+      }
+      fast_triangle_recurse(root, &pos, &dir, &closest-info, &closest, &texcoord);
+      // recurse root;
+      
+      if (closest-info) {
+        texcoord = closest-info.(uv-a + texcoord.x * uv-ca + texcoord.y * uv-ba);
+        res.(success, distance, col,      normal,         texcoord, texinfo)
+          = (true,    closest,  vec3f(1), closest-info.n, texcoord, closest-info.texture-state);
+        if (closest-info.texture-state)
+          res.col = interpolate(texcoord.(x, 1-y), closest-info.texture-state);
       }
     }
   }

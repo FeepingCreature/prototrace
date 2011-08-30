@@ -22,7 +22,9 @@ void assert(bool b, string s) {
 struct Result {
   float distance;
   vec3f normal;
-  vec3f col;
+  vec3f reflective-color, emissive-color;
+  alias col = reflective-color;
+  vec2f texcoord; void* texinfo;
   bool success;
   string toString() {
     if (success) {

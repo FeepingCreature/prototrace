@@ -5,10 +5,10 @@ import base;
 struct VMState {
   int result-id, ray-id;
   
-  Ray[] ray-stack;
+  Ray* ray-stack;
   alias ray = &ray-stack[ray-id - 1];
   
-  Result[] result-stack;
+  Result* result-stack;
   alias result = &result-stack[result-id - 1];
   
   CommandHandler[] stream;

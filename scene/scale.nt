@@ -4,36 +4,43 @@ import scene.base;
 
 extern(C) void fast_scale_process(VMState*, int numstates, float scale, void* self);
 
-class Scale : SceneObject {
-  float factor;
-  SceneObject sup;
-  class PostScale : CommandHandler {
-    void process(VMState[] list) {
-      for int i <- 0 .. list.length {
-        auto sp = &list[i];
-        if (void*:sp.handler == void*:CommandHandler:this)::
-        sp.stream = sp.stream[1..$];
-        
-        using sp mixin(freeRay.replace("!!", "1"));
-        if (sp.result.success)
-          sp.result.distance *= factor;
+class PostScale : CommandHandler {
+  vec3f factor;
+  void init(vec3f f) factor = f;
+  void process(VMState[] list) {
+    factor.w = 1;
+    for int i <- 0 .. list.length {
+      auto sp = &list[i];
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      using sp mixin(freeRay.replace("!!", "1"));
+      if (sp.result.success) {
+        sp.result.distance /= |sp.ray.dir / factor|;
       }
     }
   }
-  void init(float f, SceneObject so) (factor, sup) = (f, so);
+}
+
+class Scale : SceneObject {
+  vec3f factor;
+  SceneObject sup;
+  void init(vec3f f, SceneObject so) (factor, sup) = (f, so);
+  void init(float f, SceneObject so) (factor, sup) = (vec3f(f), so);
   bool collide(Ray* ray, Result* res) {
-    auto v = vec3f(1 / factor);
     Ray ray2 = void;
-    ray2.pos = ray.pos * v;
-    ray2.dir = ray.dir; // can't divide - must be normalized
+    ray2.pos = ray.pos / factor;
+    ray2.dir = ray.dir / factor;
+    auto rescale = ray2.dir.length; ray2.dir /= rescale;
     if (sup.collide(&ray2, res)) {
-      res.distance *= factor; // do it here instead
+      res.distance *= rescale;
       return true;
     } else return false;
   }
   void process(VMState[] list) {
-    fast_scale_process(list.ptr, list.length, factor, void*:CommandHandler:this);
-    return;
+    // fast_scale_process(list.ptr, list.length, factor, void*:CommandHandler:this);
+    // return;
+    factor.w = 1; // oops
     for int i <- 0 .. list.length {
       auto sp = &list[i];
       
@@ -43,14 +50,15 @@ class Scale : SceneObject {
       auto ray = sp.ray;
       using sp mixin(allocRay);
       auto ray2 = sp.ray;
-      ray2.pos = ray.pos * vec3f(1 / factor);
-      // ray2.dir = ray.dir;
-      xmm[4] = ray.dir; ray2.dir = xmm[4]; // TODO: do this automatically
+      ray2.pos = ray.pos / factor;
+      ray2.dir = ray.dir / factor;
+      float dist = |ray2.dir|;
+      if (dist != 0) ray2.dir /= dist;
     }
   }
   CommandHandler[] buildCommandStream(VMStats* stats) {
     stats.rays-needed-cur ++;
-    auto res = CommandHandler[]:null ~ this ~ sup.buildCommandStream(stats) ~ new PostScale;
+    auto res = CommandHandler[]:null ~ this ~ sup.buildCommandStream(stats) ~ new PostScale factor;
     using stats {
       if (rays-needed-cur > rays-needed-max)
         rays-needed-max = rays-needed-cur;

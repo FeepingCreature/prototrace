@@ -89,7 +89,7 @@ vec3f rand_sphere() {
   vec3f res;
   do res = vec3f(randf() * 2 - 1 # x 3);
   while |res| > 1 { }
-  return res;
+  return res.normalized;
 }
 
 class JitterRay : SceneObject {
@@ -156,7 +156,7 @@ class PathTraceStep : CommandHandler {
         auto nspos = sp.(ray-stack[ray-id - 2]).(pos + dir * (res.distance * 0.999));
         // writeln "nspos = $(ray.(pos, dir)) @ $(res.distance) = $(nspos)";
         sp.ray.(pos, dir) = (nspos, rand_sphere());
-        if (sp.ray.dir * res.normal).(x+y+z) < 1 sp.ray.dir = -sp.ray.dir;
+        if (sp.ray.dir * res.normal).(x+y+z) < 0 sp.ray.dir = -sp.ray.dir;
       } else {
         using sp mixin(allocResult);
         sp.stream = sp.stream[skip .. $]; // no point

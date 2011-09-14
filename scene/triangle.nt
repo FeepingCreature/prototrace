@@ -16,6 +16,7 @@ vec3f lookup(int x, y, void* texptr) {
 }
 
 vec3f interpolate(float u, v, void* texptr) {
+  // (u, v) = (v, u); // WHAAAT
   auto gdp = gdImagePtr:texptr;
   auto coord = vec2f(u, v) * vec2f(gdp.sx, gdp.sy);
   auto icoord = vec2i(int:fastfloor coord.x, int:fastfloor coord.y);
@@ -23,48 +24,6 @@ vec3f interpolate(float u, v, void* texptr) {
               lookup(icoord+vec2i.X, texptr), lookup(icoord+vec2i(1), texptr));
   auto facs = coord - vec2f(fastfloor coord.x, fastfloor coord.y);
   return pts[0]*(1-facs.x)*(1-facs.y) + pts[1]*(1-facs.x)*facs.y + pts[2]*facs.x*(1-facs.y) + pts[3]*facs.x*facs.y;
-}
-
-bool rayHitsAABB(vec3f* ap, bp, pos-p, dir-p, (float, float)* dist = null) {
-  xmm[4] = *dir-p;
-  xmm[5] = *pos-p;
-  xmm[6] = *ap;
-  xmm[7] = *bp;
-  int i = 1 << 31;
-  asm "movd (%esp), %xmm3";
-  asm `shufps $0, %xmm3, %xmm3`;
-  asm "movaps %xmm4, %xmm2";
-  asm "andps %xmm3, %xmm2"; // select sign bits of dir
-  asm "xorps %xmm2, %xmm4"; // flip signs where negative
-  asm "xorps %xmm2, %xmm5";
-  asm "xorps %xmm2, %xmm6";
-  asm "xorps %xmm2, %xmm7";
-  asm "movaps %xmm6, %xmm2";
-  asm "movaps %xmm7, %xmm3";
-  asm "minps %xmm3, %xmm6"; // a = min(a, b);
-  asm "maxps %xmm2, %xmm7"; // b = max(a, b);
-  
-  auto dir = vec3f:xmm[4];
-  auto pos = vec3f:xmm[5];
-  auto a   = vec3f:xmm[6];
-  auto b   = vec3f:xmm[7];
-  
-  // pretend ray starts at origin
-  a -= pos;
-  b -= pos;
-  if (b.x < 0 || b.y < 0 || b.z < 0) return false; // ray is pointed away from aabb.
-  // multiply every component with dir.(x*y*z)
-  // vec3f dista = a / dir, distb = b / dir;
-  vec3f mulfac = dir.yxx * dir.zzy;
-  vec3f dista = a * mulfac, distb = b * mulfac;
-  
-  float entry = max(dista.x, max(dista.y, dista.z));
-  float exit = min(distb.x, min(distb.y, distb.z));
-  if (entry <= exit) {
-    if (dist) { *dist = (entry, dir.(x*y*z)); }
-    return true;
-  }
-  return false;
 }
 
 class Triangle : SceneObject {
@@ -140,8 +99,8 @@ class Triangle : SceneObject {
         // writeln "$u, $v";
         
         if (u > 0 && v > 0 && u + v < 1) {
-          res.(success, distance, col, normal)
-            = (true,    dist,vec3f(1), normal);
+          res.(success, distance, col, emissive-color, normal)
+            = (true,    dist,vec3f(1), vec3f(0),       normal);
         } else {
           res.success = false;
         }
@@ -154,10 +113,10 @@ class Triangle : SceneObject {
   }
 }
 
-struct TriangleInfo { // ~100b
+struct TriangleInfo {
   vec3f a, b, c, n;
-  float dot00, dot01, dot11, invDenom;
-  vec2f uv-a, uv-ba, uv-ca; void* texture-state;
+  vec2f uv-a, uv-ba, uv-ca;
+  float invDenom; void* texture-state;
 }
 
 extern(C) int fast_rayHitsAABB(vec3f* abp, p_ray, float* dist);
@@ -173,14 +132,19 @@ struct AABB {
       b[i] = max(b[i], v[i]);
     }
   }
-  // can't use C fun
-  bool rayHits_unaligned(vec3f* pos-p, dir-p, (float, float)* dist = null) {
-    return rayHitsAABB(&a, &b, pos-p, dir-p, dist);
-  }
   bool rayHits(vec3f* ray-p, (float, float)* dist = null) {
     // return rayHitsAABB(&a, &b, pos-p, dir-p, dist);
     float f;
     auto res = fast_rayHitsAABB(&a, ray-p, &f);
+    if (dist) { *dist = (f, 1); }
+    return res;
+  }
+  bool rayHits_unaligned(vec3f* pos-p, dir-p, (float, float)* dist = null) {
+    vec3f pos = pos-p[0], dir = pos-p[1];
+    vec3f a = void, b = void;
+    a = this.a; b = this.b;
+    float f;
+    auto res = fast_rayHitsAABB(&a, &pos, &f);
     if (dist) { *dist = (f, 1); }
     return res;
   }
@@ -202,10 +166,21 @@ int round16(int i) { return (i + 15) &-16; }
 struct TriangleNode {
   AABB aabb;
   TriangleNode*[] children;
+  TriangleInfo[auto~] info;
   alias left = children[0], right = children[1];
   
-  TriangleInfo[auto~] info;
   // return void*:size if slab is null, res otherwise
+  void validate() {
+    if (children.length > 4) {
+      writeln "Invalid children-array: $(children.(length, ptr))";
+      _interrupt 3;
+    }
+    if (info.length > 100_000 || info.length < 0) {
+      writeln "Invalid info-array: $(info.(length, ptr))";
+      _interrupt 3;
+    }
+    for auto ch <- children ch.validate;
+  }
   void* linearAllocate(void** slabp = null) {
     if (size-of TriangleInfo & 15) { writeln "WTF! :( $(size-of TriangleInfo) => $(size-of TriangleInfo & 15)"; _interrupt 3; }
     alias slab = *slabp;
@@ -292,7 +267,7 @@ struct TriangleNode {
     for int i <- 0..3 if i != bestChoice tns[i].free;
     return res;
   }
-  void splitreplace(int verboseLevels = 0) {
+  void splitreplace() {
     auto res = split();
     if (!res) return;
     float eff = (info.length * 1f / (res.right.info.length + res.left.info.length)) - 0.5 #* 2f;
@@ -300,13 +275,8 @@ struct TriangleNode {
     // writeln "$(info.length) => $(left.info.length), $(right.info.length): efficiency of $(int:(eff*100))%";
     children = res.children;
     info.free;
-    auto nvlevels = verboseLevels - 1;
-    if (nvlevels < 0) nvlevels = 0;
-    if (verboseLevels > 0) writeln "$verboseLevels: recurse left";
-    left .splitreplace(nvlevels);
-    if (verboseLevels > 0) writeln "$verboseLevels: recurse right";
-    right.splitreplace(nvlevels);
-    if (verboseLevels > 0) writeln "$verboseLevels: complete";
+    left .splitreplace();
+    right.splitreplace();
   }
 }
 
@@ -328,15 +298,21 @@ class TriangleSet : SceneObject {
     if (ti.n == vec3f(0)) ti.n = vec3f.Y;
     ti.n = -ti.n.normalized;
     
+    float dot00 = ca * ca #.sum;
+    float dot01 = ca * ba #.sum;
+    float dot11 = ba * ba #.sum;
     // precompute
-    ti.dot00 = ca * ca #.sum;
-    ti.dot01 = ca * ba #.sum;
-    ti.dot11 = ba * ba #.sum;
-    float denom = ti.(dot00 * dot11 - dot01 * dot01);
+    float denom = dot00 * dot11 - dot01 * dot01;
     if (denom != 0) ti.invDenom = 1 / denom;
     else ti.invDenom = 1;
     
     root.addTriangle &ti;
+  }
+  void flatten() {
+    auto size = int:root.linearAllocate();
+    writeln "full slab size = $size";
+    void* ptr = aligned_calloc size;
+    root = TriangleNode*: root.linearAllocate(&ptr);
   }
   void optimize() {
     root.splitreplace(2);
@@ -355,10 +331,7 @@ class TriangleSet : SceneObject {
     }
     // may not be worth it .. test more?
     // two_to_four root;
-    auto size = int:root.linearAllocate();
-    writeln "full slab size = $size";
-    void* ptr = aligned_calloc size;
-    root = TriangleNode*: root.linearAllocate(&ptr);
+    flatten;
   }
   bool collide(Ray* ray, Result* res) { _interrupt 3; }
   void process(VMState[] list) {
@@ -378,31 +351,23 @@ class TriangleSet : SceneObject {
       float closest; TriangleInfo* closest-info;
       vec2f texcoord;
       void recurse(TriangleNode* node) {
-        if (node.left) {
+        if (node.children.length) {
           if (closest-info) {
             (float, float) fs;
             alias fdist = fs[0] / fs[1];
-            if (node.left .aabb.rayHits(&pos, &fs) && fdist < closest) recurse(node.left );
-            if (node.right.aabb.rayHits(&pos, &fs) && fdist < closest) recurse(node.right);
+            for auto ch <- node.children
+              if (ch.aabb.rayHits(&pos, &fs) && fdist < closest) recurse(ch);
           } else {
-            if (node.left .aabb.rayHits(&pos)) recurse(node.left );
-            if (node.right.aabb.rayHits(&pos)) recurse(node.right);
+            for auto ch <- node.children
+              if (ch.aabb.rayHits(&pos)) recurse(ch);
           }
         } else {
           auto trilist = node.info[];
           for auto ti <- [for i <- 0..trilist.length: &trilist[i]] {
-            float dist = void;
-            {
-              float f1 = (ti.n * (pos - ti.a)).sum;
-              float f2 = (dir * ti.n).sum;
-              // dist = - f1 / f2
-              asm "movd (%esp), %xmm4";
-              asm "movd 4(%esp), %xmm5";
-              asm "xorps %xmm6, %xmm6";
-              asm "subss %xmm5, %xmm6";
-              asm "divss %xmm4, %xmm6";
-              asm "movd %xmm6, 8(%esp)";
-            }
+            float f1 = (ti.n * (pos - ti.a)).sum;
+            float f2 = (dir * ti.n).sum;
+            if (f2 != 0) ::
+            float dist = - f1 / f2;
             if (dist > 0)::
             if (!closest-info || dist < closest):: // no point otherwise
             auto p = pos + vec3f(dist) * dir;
@@ -412,9 +377,11 @@ class TriangleSet : SceneObject {
             xmm[6] =    p; xmm[6] -= xmm[7];
             alias v0 = xmm[4], v1 = xmm[5], v2 = xmm[6];
             float
+              dot00 = v0 * v0 #.sum,
+              dot01 = v0 * v1 #.sum,
               dot02 = v0 * v2 #.sum,
+              dot11 = v1 * v1 #.sum,
               dot12 = v1 * v2 #.sum;
-            alias dot00 = ti.dot00, dot01 = ti.dot01, dot11 = ti.dot11;
             float invDenom = ti.invDenom;
             
             float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
@@ -432,8 +399,8 @@ class TriangleSet : SceneObject {
       
       if (closest-info) {
         texcoord = closest-info.(uv-a + texcoord.x * uv-ca + texcoord.y * uv-ba);
-        res.(success, distance, col,      normal,         texcoord, texinfo)
-          = (true,    closest,  vec3f(1), closest-info.n, texcoord, closest-info.texture-state);
+        res.(success, distance, col,      emissive-color, normal,         texcoord, texinfo)
+          = (true,    closest,  vec3f(1), vec3f(0),       closest-info.n, texcoord, closest-info.texture-state);
         if (closest-info.texture-state)
           res.col = interpolate(texcoord.(x, 1-y), closest-info.texture-state);
       }

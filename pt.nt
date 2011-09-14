@@ -6,11 +6,21 @@ import std.boehm;
 import
   scene.checkerpattern, scene.group, scene.plane, scene.scale,
   scene.sphere, scene.translate, scene.triangle, scene.util,
-  scene.color, scene.base;
+  scene.color, scene.base, scene.bound;
+
+alias EPS = 0.999;
 
 extern(C) {
-  void fastsetup(int yfrom, yto, dw, dh, VMState*);
+  void fastsetup(int xfrom, xto, yfrom, yto, dw, dh, VMState*);
   void fast_light_process(VMState*, int numstates, vec3f* lightpos, void* self);
+}
+
+import gd;
+gdImagePtr readGd(string fname) {
+  auto fdata = readAll fname;
+  if (fname.toLower().endsWith ".jpg") return gdImageCreateFromJpegPtr(fdata.(length, ptr));
+  if (fname.toLower().endsWith ".png") return gdImageCreateFromPngPtr(fdata.(length, ptr));
+  raise-error new Error "Unknown extension in '$fname'! ";
 }
 
 class LightStep : CommandHandler {
@@ -26,11 +36,14 @@ class LightStep : CommandHandler {
         sp.stream = sp.stream[1..$];
         
         auto res = &sp.(result-stack[result-id - 2]);
-        if (res.success) {
+        if (res.success && res.reflective-color != vec3f(0)) {
           vec3f lightdir = (*lightpos) - sp.ray.pos;
           float lightdist = |lightdir|;
           lightdir = lightdir.normalized;
-          vec3f lightprod = lightdir * res.normal;
+          auto norm = res.normal;
+          if ((norm * sp.(ray-stack[ray-id - 2].dir)).sum > 0)
+            norm = -norm;
+          vec3f lightprod = lightdir * norm;
           float lightangle = lightprod.sum;
           
           vec3f resv = vec3f(0);
@@ -57,8 +70,12 @@ class LightStep : CommandHandler {
       sp.stream = sp.stream[1..$];
       
       auto res = sp.result;
-      if (res.success) {
+      if (res.success && res.reflective-color != vec3f(0)) {
+<<<<<<< Updated upstream
+        auto nspos = sp.ray.(pos + dir * (res.distance * EPS));
+=======
         auto nspos = sp.ray.(pos + dir * (res.distance * 0.999));
+>>>>>>> Stashed changes
         // writeln "nspos = $(sp.ray.(pos, dir)) @ $(res.distance) = $(nspos), lightpos $(*lightpos)";
         using sp mixin(allocRay);
         vec3f lightdir = ((*lightpos) - nspos).normalized;
@@ -152,11 +169,17 @@ class PathTraceStep : CommandHandler {
       using sp mixin(allocRay);
       
       auto res = sp.(result-stack[result-id - 1 - res-delta]);
-      if (res.success) {
+      if (res.success && res.reflective-color != vec3f(0)) {
+<<<<<<< Updated upstream
+        auto nspos = sp.(ray-stack[ray-id - 2]).(pos + dir * (res.distance * EPS));
+=======
         auto nspos = sp.(ray-stack[ray-id - 2]).(pos + dir * (res.distance * 0.999));
+>>>>>>> Stashed changes
         // writeln "nspos = $(ray.(pos, dir)) @ $(res.distance) = $(nspos)";
         sp.ray.(pos, dir) = (nspos, rand_sphere());
-        if (sp.ray.dir * res.normal).(x+y+z) < 0 sp.ray.dir = -sp.ray.dir;
+        auto norm = res.normal;
+        if ((norm * sp.(ray-stack[ray-id - 1].dir)).sum >= 0) norm = -norm;
+        if (sp.ray.dir * norm).(x+y+z) < 0 sp.ray.dir = -sp.ray.dir;
       } else {
         using sp mixin(allocResult);
         sp.stream = sp.stream[skip .. $]; // no point
@@ -205,6 +228,7 @@ class PathTraceLighting : SceneObject {
       }
       // summary: neutral
     } else {
+      int base-id = stats.results-needed-cur;
       stats.rays-needed-cur ++;
       stats.results-needed-cur ++;
       auto stream2 = sup2.buildCommandStream(stats);
@@ -212,13 +236,15 @@ class PathTraceLighting : SceneObject {
       stats.rays-needed-cur --;
       auto pt = new PathTraceStep(stream.length, 1 /* skip one result (our empty averager) */);
       auto fr = new FreeRay;
-      auto as = new AverageStep avg;
+      auto as = new AverageStep (avg, base-id, base-id + 1);
+      auto fs = new FreeResult;
       res ~= new AllocEmptyResult; // results ++
       for (int i = 0; i < avg; ++i) {
         res ~= pt; // rays ++
         res ~= stream2; // results ++
         res ~= fr; // rays --
-        res ~= as; // results --
+        res ~= as;
+        res ~= fs; // results --
       }
       res ~= pt.mkMergeStep(); // results --
       // neutral
@@ -229,7 +255,6 @@ class PathTraceLighting : SceneObject {
 
 import std.time, std.file;
 import c.fenv;
-import gd;
 extern(C) { void GC_disable(); void GC_gcollect(); void GC_enable(); }
 extern(C) int feenableexcept(int);
 void main(string[] args) {
@@ -254,7 +279,9 @@ void main(string[] args) {
   
   SceneObject scene;
   SceneObject object;
-  using new TriangleSet {
+  float lowest = 0;
+  using new Group {
+    auto bb = new BoxBound that;
     alias objfile = "hikone.obj";
     auto obj = string: import(objfile) #.split "\n";
     alias mtlfile = objfile.replace(".obj", ".mtl");
@@ -278,15 +305,15 @@ void main(string[] args) {
         writeln "No texture found for $matname! ";
         return null;
       } else {
-        auto fdata = readAll fname;
-        writeln "Read jpg: $matname => $fname ($$fdata.length bytes)";
-        auto data = gdImageCreateFromJpegPtr(fdata.(length, ptr));
+        auto data = readGd fname;
+        writeln "Read image: $matname => $fname";
         if (data) writeln "($(data.sx), $(data.sy))";
         matcache ~= (matname, void*:data);
         return data;
       }
     }
     
+    alias mew = string;
     string[] selectAs(string delegate(string) dg) {
       string[auto~] res;
       for auto line <- obj if auto thing = dg line res ~= thing;
@@ -304,6 +331,16 @@ void main(string[] args) {
     onSuccess { vertices.free; texcoords.free; }
     auto fusemtl = selectOn(delegate bool(string s) return eval s.startsWith "f " || s.startsWith "usemtl "; );
     void* currentTexture;
+    auto currentSet = new TriangleSet;
+    void flush() {
+      writeln "aabb = $(currentSet.root.aabb.a), $(currentSet.root.aabb.b)";
+      if (currentSet.root.aabb.a.y < lowest) lowest = currentSet.root.aabb.a.y;
+      currentSet.optimize;
+      writeln "Tree optimized";
+      list ~= currentSet;
+      bb.addBox(currentSet.root.aabb.(a, b));
+      currentSet = new TriangleSet;
+    }
     for auto line <- fusemtl {
       if auto rest = line.startsWith "f " {
         auto poly = rest.split " ";
@@ -314,8 +351,9 @@ void main(string[] args) {
           (vertices[pair[0]], texcoords[pair[1]])
         ].eval[];
         for (int i = 2; i < poly.length; ++i)
-          // addTriangle indices[(0, i-1, i)];
-          addTriangle (indices[(0, i, i-1)], currentTexture);
+          currentSet.addTriangle (indices[(0, i, i-1)], currentTexture);
+        if (currentSet.root.info.length > 1024)
+          flush;
         indices.free;
         poly.free;
       }
@@ -323,20 +361,20 @@ void main(string[] args) {
         currentTexture = lookupMatl rest;
       }
     }
+    flush;
     obj.free;
+    mtl.free;
+    writeln "$(that.list.length) sub-objects";
     // writeln "$(infos.length) tris. ";
-    writeln "aabb = $(that.root.aabb.a), $(that.root.aabb.b)";
-    optimize;
-    writeln "Tree optimized";
-    object = that;
+    object = bb;
   }
   using new Group {
     // list ~= new CheckerPattern(vec3f(0, 1, 0), vec3f(0, 0, 1), new Plane(vec3f(0, 1, 0), vec3f(0, 0, 0)));
     list ~= new Scale(1/10.0, new CheckerPattern(vec3f(1, 0.95, 0.8), vec3f(0.8, 0.95, 1), new Plane(vec3f(0, 1, 0), vec3f(0, 0, 0))));
-    list ~= new Color(vec3f(0.2, 0.23, 0.3), new Plane(vec3f(0, -1, 0), vec3f(0, 100, 0)));
+    list ~= new Shine(vec3f(1.2, 1.23, 1.3), new Plane(vec3f(0, -1, 0), vec3f(0, 100, 0)));
     // list ~= new Translate(vec3f(0, 0, 5), new Scale(0.2, new CheckerPattern(vec3f(0, 1, 0), vec3f(1, 0, 0), new Sphere(vec3f(0, 0, 0), 10))));
     // list ~= new Translate(vec3f(0, 0, 5), new Scale(2.5, new Triangle(vec3f(-1, 0.1, -1), vec3f(-1, 0.1, 1), vec3f(1, 0.1, -1))));
-    list ~= new Translate(vec3f(0, 1, 5), new Scale(1/30.0, object));
+    list ~= new Translate(vec3f(1, -lowest / 25, 5), new Scale(vec3f(-1/25.0, 1/25.0, -1/25.0), object));
     scene = that;
   }
   
@@ -352,6 +390,8 @@ void main(string[] args) {
   for auto arg <- args if auto rest = arg.startsWith "-samples=" samples = rest.atoi();
   (int, int) imgres; // fixed-size single-pass render
   for auto arg <- args if auto rest = arg.startsWith "-res=" using rest.split("x") imgres = (that[0].atoi(), that[1].atoi());
+  string file = "out.png";
+  for auto arg <- args if auto rest = arg.startsWith "-o=" file = rest;
   bool jitter;
   for auto arg <- args if arg == "-jitter" jitter = true;
   for auto arg <- args if arg == "-keep-going" break-on-float-errors = false;
@@ -360,7 +400,7 @@ void main(string[] args) {
     for auto val <- [FE_DIVBYZERO, FE_INVALID/*, FE_OVERFLOW I said infs are fine >_>*/]
       feenableexcept val;
   
-  scene = new LightSource(&lightpos, scene);
+  // scene = new LightSource(&lightpos, scene);
   float ratio = 1;
   if (imgres[0]) ratio = imgres[0] * 1f / imgres[1];
   
@@ -376,7 +416,7 @@ void main(string[] args) {
     scene = new PathTraceLighting(samples, scene, new PathTraceLighting (scene, new PathTraceLighting scene));
   }
   
-  vec3f[] resbuffer;
+  vec4f[] resbuffer;
   
   VMStats stats;
   stats.rays-needed-cur = 1;
@@ -391,20 +431,22 @@ void main(string[] args) {
   auto start = sec(), firststart = start;
   int iters; long rays;
   
+  alias tilesize = 10;
+  
   auto ray-res-vm-map = new (Ray[], Result[], VMState[])[] threads;
   void* align16(void* v) { return void*:(int:v + 15 #&-16); }
-  void render(int thread, int yfrom, yto) {
+  void render(int thread, int tile) {
     lightpos = vec3f(sin(lightrot) * 10 - 5, 5, cos(lightrot) * 10);
     (int dw, int dh) = desired-display-size;
     alias my-ray-map = ray-res-vm-map[thread][0];
     alias my-res-map = ray-res-vm-map[thread][1];
     alias my-vm-map = ray-res-vm-map[thread][2];
+    int count = tilesize * tilesize;
     // split into subfunctions for the benefit of the profiler.
     void setup() {
       auto xstream = stream;
       int resn = results-needed, rayn = rays-needed;
       // prealloc vm, results, rays
-      int count = (yto - yfrom) * dw;
       if (my-vm-map.length != count + 1) {
         my-vm-map.free;
         my-vm-map = new VMState[] (count + 1);
@@ -420,7 +462,12 @@ void main(string[] args) {
       Ray[] ray-slab = Ray*:align16(my-ray-map.ptr) #[0..my-ray-map.length - 1];
       Result[] res-slab = Result*:align16(my-res-map.ptr) #[0..my-res-map.length - 1];
       auto state = VMState*:align16(my-vm-map.ptr);
-      for (int y, int x) <- cross(yfrom..yto, 0..dw) {
+      
+      int xfrom = tile % (dw / tilesize) # * tilesize;
+      int yfrom = tile / (dw / tilesize) # * tilesize;
+      int xto = xfrom + tilesize, yto = yfrom + tilesize;
+      
+      for (int y, int x) <- cross(yfrom..yto, xfrom..xto) {
         // float fx = x / (dw/2f) - 1f, fy = 1f - y / (dh/2f);
         using state {
           // result-id = 0;
@@ -435,35 +482,42 @@ void main(string[] args) {
           // ray.dir = dir;
           stream = xstream;
         }
+        state.(x, y) = (x, y);
         state ++;
       }
-      fastsetup(yfrom, yto, dw, dh, align16(&my-vm-map[0]));
+      fastsetup(xfrom, xto, yfrom, yto, dw, dh, align16(&my-vm-map[0]));
     }
     void process() {
       check;
       auto rayqueue = VMState*:align16(my-vm-map.ptr) #[0..my-vm-map.length - 1];
+      // writeln "PROCESS";
       do {
         while (rayqueue.length && !rayqueue[0].handler) rayqueue = rayqueue[1 .. $];
       } while (rayqueue.length) {
-        auto hdl = rayqueue[0].handler;
+        auto hdl = rayqueue[0].stream.ptr;
+        for auto rq <- rayqueue if int:rq.stream.ptr < int:hdl hdl = rq.stream.ptr;
+        // int num;
+        // for auto rq <- rayqueue if int:rq.handler == int:*hdl num++;
+        // writeln "$(*hdl): $num out of $(rayqueue.length)";
         hdl.process rayqueue;
       }
+      // writeln "END";
     }
     void finalize() {
-      auto my-resbuffer = resbuffer[yfrom * dw .. yto * dw];
       auto state = VMState*:align16(my-vm-map.ptr);
-      auto resptr = my-resbuffer.ptr;
-      for int i  <- 0 .. my-vm-map.length - 1 {
+      for int i <- 0 .. count {
         auto res = &state.result-stack[0];
-        if (!res.success) *resptr = vec3f(0);
+        int tile = (state.y / tilesize) * (dw / tilesize) + (state.x / tilesize);
+        auto rp = &resbuffer[(tile * tilesize + state.y % tilesize) * tilesize + (state.x % tilesize)];
+        if (!res.success) *rp = vec4f.W;
         else {
-          *resptr = res.emissive-color;
+          *rp = res.emissive-color;
           float maxf(float a, b) return [a, b][eval b > a];
-          if (resptr.(maxf(x, maxf(y, z))) > 1)
-            (*resptr) /= resptr.(maxf(x, maxf(y, z)));
+          if (rp.(maxf(x, maxf(y, z))) > 1)
+            (*rp) /= rp.(maxf(x, maxf(y, z)));
+          rp.w = 1;
         }
         state ++;
-        resptr ++;
       }
     }
     setup();
@@ -474,18 +528,29 @@ void main(string[] args) {
   auto lp = new LoopPool threads;
   
   if (imgres[0] && imgres[1]) {
-    resbuffer = new vec3f[] (imgres[0] * imgres[1]);
+    
+    resbuffer = new vec4f[] (imgres[0] * imgres[1]);
+    resbuffer[] = [for 0..resbuffer.length: vec4f.W];
+    
     auto surf = screen(imgres, surface => true);
     writeln "Calculate $(imgres). ";
-    bool done; int lines-done;
+    bool done; int tiles-done;
     void save() {
       auto gdp = gdImageCreateTrueColor(imgres);
       onSuccess gdImageDestroy gdp;
-      for (int y, int x) <- cross(0..surf.h, 0..surf.w) {
-        // writeln "$x, $y: $(floatToIntColor resbuffer[y * desired-display-size[0] + x]) <= $(resbuffer[y * desired-display-size[0] + x])";#
-        gdp.tpixels[y][imgres[0] - 1 - x] = floatToIntColor resbuffer[y * imgres[0] + x];
+      // MORE COPYPASTE (from below)
+      int xtiles = surf.w / tilesize, ytiles = surf.h / tilesize;
+      int tiles = xtiles * ytiles;
+      int k;
+      for int tile <- 0..tiles {
+        int xfrom = tile % xtiles # * tilesize;
+        int yfrom = tile / xtiles # * tilesize;
+        int xto = xfrom + tilesize, yto = yfrom + tilesize;
+        for (int y, int x) <- cross(yfrom .. yto, xfrom .. xto) {
+          gdp.tpixels[y][imgres[0] - 1 - x] = floatToIntColor resbuffer[k++].(xyz/w);
+        }
       }
-      auto hdl = fopen ("out.png", "w");
+      auto hdl = fopen (file.toStringz(), "w");
       gdImagePng(gdp, c.gd.FILE*: hdl);
       fclose hdl;
     }
@@ -493,13 +558,15 @@ void main(string[] args) {
       auto start = sec();
       while !done {
         auto t = sec(), delta = float:(t - start);
-        if (lines-done)
-          writeln "$(int:delta)s: $(lines-done * 100 #/imgres[1])% done, est. $(int:(delta * imgres[1] #/lines-done - delta))s left. ";
+        if (tiles-done) {
+          int num-tiles = (imgres[0] * imgres[1]) / (tilesize * tilesize);
+          writeln "$(int:delta)s: $(tiles-done * 100 / num-tiles)% done, est. $(int:(delta * num-tiles / tiles-done - delta))s left. ";
+        }
         save();
         sleep 1;
       }
     };
-    lp.runLoop(imgres[1], delegate void(int line, thr) { render(thr, line, line + 1); lines-done ++; });
+    lp.runLoop((imgres[0] / tilesize) * (imgres[1] / tilesize), delegate void(int tile-id, thr) { render(thr, tile-id); tiles-done ++; });
     done = true;
     writeln "Save. ";
     save();
@@ -508,9 +575,11 @@ void main(string[] args) {
   
   auto resbuffer-lock = new ReadWriteLock;
   
-  auto surf = screen(150, 150, surface => true);
+  auto surf = screen(600, 600, surface => true);
   desired-display-size = surf.(w, h);
-  resbuffer = new vec3f[] surf.(w * h);
+  
+  resbuffer = new vec4f[] surf.(w * h);
+  resbuffer[] = [for 0..resbuffer.length: vec4f.W];
   
   onResize(800, 800);
   bool stop;
@@ -520,8 +589,8 @@ void main(string[] args) {
     while !stop {
       resbuffer-lock.lock-read();
         auto rdg = &render;
-        auto ddsy = desired-display-size[1];
-        lp.runLoop(ddsy, delegate void(int line, thr) { rdg(thr, line, line + 1); });
+        auto ddsx = desired-display-size[0], ddsy = desired-display-size[1], tilesize = tilesize;
+        lp.runLoop((ddsx * ddsy) / (tilesize * tilesize), delegate void(int tile, thr) { rdg(thr, tile); });
       resbuffer-lock.unlock();
       iters ++;
       rays += surf.(w*h);
@@ -542,10 +611,12 @@ void main(string[] args) {
       if (absf (pixelfactor - 1) > 0.05 && delta > 1) {
         if (psq < 0.7) psq = 0.7;
         (int, int) updated-size = (int:(surf.w / psq), int:(surf.h / psq));
+        updated-size = (updated-size[0] / 10 #* 10, updated-size[1] / 10 #* 10);
         resbuffer-lock.lock-write();
           desired-display-size = updated-size;
           resbuffer.free;
-          resbuffer = new vec3f[] (updated-size[0] * updated-size[1]);
+          resbuffer = new vec4f[] (updated-size[0] * updated-size[1]);
+          resbuffer[] = [for 0..resbuffer.length: vec4f.W];
         resbuffer-lock.unlock();
         // reset estimation
         iters = 0; start = sec();
@@ -568,9 +639,18 @@ void main(string[] args) {
   while (true) {
     auto start-draw = sec();
     resbuffer-lock.lock-read();
-      for (int y, int x) <- cross(0..surf.h, 0..surf.w) {
-        surf.pset(x, y, resbuffer[y * desired-display-size[0] + x]);
+    int xtiles = surf.w / tilesize, ytiles = surf.h / tilesize;
+    int tiles = xtiles * ytiles;
+    int k;
+    for int tile <- 0..tiles {
+      // ahh .. the sweet sound of copypaste
+      int xfrom = tile % xtiles # * tilesize;
+      int yfrom = tile / xtiles # * tilesize;
+      int xto = xfrom + tilesize, yto = yfrom + tilesize;
+      for (int y, int x) <- cross(yfrom .. yto, xfrom .. xto) {
+        surf.pset(x, y, resbuffer[k++].(xyz/w));
       }
+    }
     resbuffer-lock.unlock();
     mode GL {
       Viewport (0, 0, display.(w, h));

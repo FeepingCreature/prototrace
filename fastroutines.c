@@ -25,6 +25,7 @@ struct VMState {
   struct Ray *rays_ptr;
   struct Result *res_ptr;
   int stream_len; void** stream_ptr;
+  int x, y;
 };
 
 typedef float v4sf __attribute__ ((vector_size (16)));
@@ -32,10 +33,10 @@ typedef int v4si __attribute__ ((vector_size (16)));
 
 #define ALIGNED __attribute__ ((force_align_arg_pointer))
 
-void ALIGNED fastsetup(int yfrom, int yto, int dw, int dh, struct VMState* state) {
+void ALIGNED fastsetup(int xfrom, int xto, int yfrom, int yto, int dw, int dh, struct VMState* state) {
   float ratio = dw * 1.0f / dh;
   for (int y = yfrom; y < yto; ++y) {
-    for (int x = 0; x < dw; ++x) {
+    for (int x = xfrom; x < xto; ++x) {
       state->resid = 0;
       state->rayid = 1;
       float fx = x, fy = y;
@@ -76,17 +77,18 @@ void ALIGNED fastsetup(int yfrom, int yto, int dw, int dh, struct VMState* state
 #define IZ(vec) __builtin_ia32_vec_ext_v4si ((vec), 2)
 #define IW(vec) __builtin_ia32_vec_ext_v4si ((vec), 3)
 // benched as fastest
-#define XSUM(vec) X(SUM(vec))
+// TODO: rebench
+// #define XSUM(vec) X(SUM(vec))
 // Why is this slower? WE MAY NEVER KNOW.
 #define SUMX(vec) (X(vec) + X(__builtin_ia32_shufps((vec), (vec), 0x55)) + X(__builtin_ia32_shufps((vec), (vec), 0xaa)))
 /*#define XSUM(vec) (\
     __builtin_ia32_vec_ext_v4sf ((vec), 0) \
   + __builtin_ia32_vec_ext_v4sf ((vec), 1) \
   + __builtin_ia32_vec_ext_v4sf ((vec), 2))*/
-/*#define XSUM(vec) __builtin_ia32_vec_ext_v4sf(\
+#define XSUM(vec) __builtin_ia32_vec_ext_v4sf(\
   __builtin_ia32_shufps((vec), (vec), 0xaa)\
 + __builtin_ia32_haddps((vec), (vec))\
-, 0)*/
+, 0)
 // #define XSUM(vec) (*(float*) &(vec) + *((float*) &(vec) + 1) + *((float*) &(vec) + 2))
 #define XYZ(v) (v).x, (v).y, (v).z
 #define V4SF(v) (*(v4sf*) &(v))
@@ -251,7 +253,8 @@ void ALIGNED fast_plane_process(
     else {
       res->success = 1;
       res->distance = dist;
-      V4SF(res->col) = (v4sf) FOUR(1);
+      res->col = (vec3f){1,1,1,1};
+      res->emissive_col = (vec3f){0,0,0,0};
       res->normal = normal;
     }
   }
@@ -344,8 +347,8 @@ void ALIGNED fast_light_process(
 
 typedef struct {
   vec3f a, b, c, n;
-  float dot00, dot01, dot11, invDenom;
-  vec2f uv_a, uv_ba, uv_ca; void *texstate;
+  vec2f uv_a, uv_ba, uv_ca;
+  float invDenom; void *texstate;
 } TriangleInfo;
 
 typedef struct {
@@ -391,7 +394,7 @@ static int internal_rayHitsAABB2d(v4sf ab, v4sf ray, float *dist) {
   ray = (v4sf) (*(v4si*) &ray ^ signs);
   ab = (v4sf) {fminf(X(ab), Z(ab)), fminf(Y(ab), W(ab)), fmaxf(X(ab), Z(ab)), fmaxf(Y(ab), W(ab))} - (v4sf) {X(ray), Y(ray), X(ray), Y(ray)};
   v4si absign = mask & *(v4si*)&ab;
-  if (IZ(absign) | IW(absign) != 0) return 0;
+  if (IZ(absign) | IW(absign)) return 0;
   
   // multiply every component with dir.(x*y)
   // vec3f distab = ab / {dir, dir};
@@ -430,6 +433,7 @@ static int internal_rayHitsAABB(vec3f *abp, vec3f *p_ray, float *dist) {
       v4sf ray = (v4sf) {X(SF(p_pos)), Y(SF(p_pos)), X(SF(p_dir)), Y(SF(p_dir))};
       return internal_rayHitsAABB2d(ab, ray, dist);
     }
+    __asm__("int $3");
     return 0; // should never happen, only here for gcc flow control
   }
   #undef SF
@@ -445,7 +449,7 @@ static int internal_rayHitsAABB(vec3f *abp, vec3f *p_ray, float *dist) {
   
   // if (X(b) < 0 || Y(b) < 0 || Z(b) < 0) return 0; // ray is pointed away from aabb.
   v4si bsign = mask & *(v4si*)&b;
-  if (IX(bsign) | IY(bsign) | IZ(bsign) != 0) return 0;
+  if (IX(bsign) | IY(bsign) | IZ(bsign)) return 0;
   
   a = __builtin_ia32_minps(a, b_) - pos;
   // multiply every component with dir.(x*y*z)
@@ -480,9 +484,13 @@ typedef struct {
 
 #include <float.h>
 
+#define ROUND16(X) ((void*) ((unsigned int)((char*) (X) + 15) & ~15))
+
+#define EPS 0.1
+
 static void __attribute__ ((hot)) internal_triangle_recurse(TriangleNode *node, RecursionInfo *info) {
-  __builtin_prefetch(&((TriangleInfo*)(node + 1))->a);
-  __builtin_prefetch(&((TriangleInfo*)(node + 1))->n);
+  // __builtin_prefetch(&((TriangleInfo*) ROUND16(node + 1))->a);
+  // printf("early prefetch %p\n", &((TriangleInfo*) ROUND16(node+1))->a);
   if (node->children_length) {
     if (info->closest_res) {
       float fs;
@@ -495,30 +503,36 @@ static void __attribute__ ((hot)) internal_triangle_recurse(TriangleNode *node, 
       }
     }
   } else {
-    __builtin_prefetch(&node->info[0]);
+    // printf("late prefetch %p\n", (void*) &node->info[0]);
+    // already prefetched up top
+    // __builtin_prefetch(&node->info[0]);
+    RecursionInfo rin = *info;
     for (int i = 0; i < node->length; ++i) {
-      __builtin_prefetch(&node->info[i+1]);
+      // __builtin_prefetch(&node->info[i+1]);
       TriangleInfo *ti = &node->info[i];
-      v4sf v_1 = V4SF(ti->n) * (V4SF(info->pos) - V4SF(ti->a));
-      v4sf v_2 = V4SF(info->dir) * V4SF(ti->n);
+      // printf("now access %p\n", (void*) &ti->a);
+      // __asm__("int $3");
+      v4sf v_1 = V4SF(ti->n) * (V4SF(rin.pos) - V4SF(ti->a));
+      v4sf v_2 = V4SF(rin.dir) * V4SF(ti->n);
       // float dist = - XSUM(v_1) / XSUM(v_2);
       // if (dist < 0) continue;
       float f_1 = XSUM(v_1), f_2 = XSUM(v_2);
-      if (
-        f_2 >= 0 /* otherwise, backside hit */ ||
-        f_1 < 0) continue;
-      // if (f_2 == 0) continue;
-      // float dist = - f_1 / f_2;
-      // don't need to retest this since info->closest starts out FLT_MAX
-      if (LIKELY(-info->closest * f_2 < f_1)) continue;
+      if (f_2 == 0) continue;
       float dist = - f_1 / f_2;
-      // if (dist < 0 || dist > info->closest) continue;
-      v4sf p = V4SF(info->pos) + (v4sf) FOUR(dist) * V4SF(info->dir);
+      // if (
+      //   f_2 >= 0 /* otherwise, backside hit */ ||
+      //   f_1 < 0) continue;
+      // float dist = - f_1 / f_2;
+      // don't need to retest this since rin->closest starts out FLT_MAX
+      // if (LIKELY(-rin.closest * f_2 < f_1)) continue;
+      if (dist < 0 || dist > rin.closest) continue;
+      // if (dist < 0.1) continue;
+      v4sf p = V4SF(rin.pos) + (v4sf) FOUR(dist) * V4SF(rin.dir);
       v4sf v0 = V4SF(ti->c) - V4SF(ti->a);
       v4sf v1 = V4SF(ti->b) - V4SF(ti->a);
       v4sf v2 = p           - V4SF(ti->a);
-      v4sf v02 = v0 * v2, v12 = v1 * v2;
-      float dot00 = ti->dot00, dot01 = ti->dot01, dot11 = ti->dot11;
+      v4sf v00 = v0 * v0, v01 = v0 * v1, v11 = v1 * v1, v02 = v0 * v2, v12 = v1 * v2;
+      float dot00 = XSUM(v00), dot01 = XSUM(v01), dot11 = XSUM(v11);
       float dot02 = XSUM(v02), dot12 = XSUM(v12);
       float invDenom = ti->invDenom;
       
@@ -532,11 +546,12 @@ static void __attribute__ ((hot)) internal_triangle_recurse(TriangleNode *node, 
       // float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
       int test = (u > 0) & (v > 0) & (u+v < 1);
       if (UNLIKELY(test)) {
-        info->closest_res = ti;
-        info->closest = dist;
-        info->uv = (vec2f) {u, v};
+        rin.closest_res = ti;
+        rin.closest = dist;
+        rin.uv = (vec2f) {u, v};
       }
     }
+    *info = rin;
   }
 }
 

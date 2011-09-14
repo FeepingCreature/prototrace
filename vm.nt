@@ -13,6 +13,8 @@ struct VMState {
   
   CommandHandler[] stream;
   
+  int x, y;
+  
   alias handler = stream[0];
   alias allocResult = `
     result-id ++;

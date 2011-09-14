@@ -4,7 +4,8 @@ import scene.base;
 
 class AverageStep : CommandHandler {
   int count;
-  void init(int c) { count = c; }
+  int dst, src; // average src into dst
+  void init(int c, dst, src) { (count, this.dst, this.src) = (c, dst, src); }
   void process(VMState[] list) {
     float factor = 1f / count;
     for int i <- 0 .. list.length {
@@ -13,13 +14,12 @@ class AverageStep : CommandHandler {
       if (void*:sp.handler == void*:CommandHandler:this)::
       sp.stream = sp.stream[1..$];
       
-      auto res1 = &sp.(result-stack[result-id - 2]), res2 = sp.result;
-      vec3f ecol1 = vec3f(0), ecol2 = vec3f(0);
-      if (res1.success) ecol1 = res1.emissive-color;
-      if (res2.success) ecol2 = res2.emissive-color;
+      auto res1 = &sp.result-stack[dst], res2 = &sp.result-stack[src];
+      vec3f sum = vec3f(0);
+      if (res1.success) sum = res1.emissive-color;
+      if (res2.success) sum += res2.emissive-color * factor;
       res1.success |= res2.success;
-      res1.emissive-color = ecol1 + ecol2 * factor;
-      using sp mixin(freeResult.replace("!!", "1"));
+      res1.emissive-color = sum;
     }
   }
 }
@@ -38,22 +38,38 @@ class AllocEmptyResult : CommandHandler {
   }
 }
 
+class FreeResult : CommandHandler {
+  void process(VMState[] list) {
+    for int i <- 0 .. list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      using sp mixin(freeResult.replace("!!", "1"));
+    }
+  }
+}
+
 class AverageResults : SceneObject {
   SceneObject sup;
   int count;
   void init(int count, SceneObject sup) this.(sup, count) = (sup, count);
   CommandHandler[] buildCommandStream(VMStats* stats) {
+    int base-id = stats.results-needed-cur;
     stats.results-needed-cur ++;
     auto stream = sup.buildCommandStream(stats);
     stats.results-needed-cur --;
     
-    auto as = new AverageStep count;
+    auto as = new AverageStep (count, base-id, base-id + 1);
+    auto fr = new FreeResult;
     
     CommandHandler[auto~] res;
-    res ~= new AllocEmptyResult;
+    res ~= new AllocEmptyResult; // res ++
     for (int i = 0; i < count; ++i) {
-      res ~= stream;
+      res ~= stream; // res ++
       res ~= as;
+      res ~= fr; // res --
     }
     return res[];
   }

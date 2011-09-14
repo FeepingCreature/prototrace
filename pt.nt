@@ -71,11 +71,7 @@ class LightStep : CommandHandler {
       
       auto res = sp.result;
       if (res.success && res.reflective-color != vec3f(0)) {
-<<<<<<< Updated upstream
         auto nspos = sp.ray.(pos + dir * (res.distance * EPS));
-=======
-        auto nspos = sp.ray.(pos + dir * (res.distance * 0.999));
->>>>>>> Stashed changes
         // writeln "nspos = $(sp.ray.(pos, dir)) @ $(res.distance) = $(nspos), lightpos $(*lightpos)";
         using sp mixin(allocRay);
         vec3f lightdir = ((*lightpos) - nspos).normalized;
@@ -170,11 +166,7 @@ class PathTraceStep : CommandHandler {
       
       auto res = sp.(result-stack[result-id - 1 - res-delta]);
       if (res.success && res.reflective-color != vec3f(0)) {
-<<<<<<< Updated upstream
         auto nspos = sp.(ray-stack[ray-id - 2]).(pos + dir * (res.distance * EPS));
-=======
-        auto nspos = sp.(ray-stack[ray-id - 2]).(pos + dir * (res.distance * 0.999));
->>>>>>> Stashed changes
         // writeln "nspos = $(ray.(pos, dir)) @ $(res.distance) = $(nspos)";
         sp.ray.(pos, dir) = (nspos, rand_sphere());
         auto norm = res.normal;

@@ -1,0 +1,90 @@
+module scene.texture;
+
+import base, gd;
+
+vec3f lookup(int x, y, Texture* texptr) {
+  if (auto gdp = texptr.gdp) {
+    int res = gdp.tpixels[y%gdp.sy][x%gdp.sx];
+    return vec3f((res>>16)&0xff, (res>>8)&0xff, (res>>0)&0xff) / 256;
+  } else {
+    return texptr.hdp.(data[y * w + x]);
+  }
+}
+
+vec3f interpolate(float u, v, Texture* texptr) {
+  int w, h;
+  if (auto p = texptr.gdp) (w, h) = p.(sx, sy);
+  else (w, h) = texptr.hdp.(w, h);
+  auto coord = vec2f(u, v) * vec2f(w, h);
+  auto icoord = vec2i(int:fastfloor coord.x, int:fastfloor coord.y);
+  auto pts = (lookup(icoord, texptr),         lookup(icoord+vec2i.Y,  texptr),
+              lookup(icoord+vec2i.X, texptr), lookup(icoord+vec2i(1), texptr));
+  auto facs = coord - vec2f(fastfloor coord.x, fastfloor coord.y);
+  return pts[0]*(1-facs.x)*(1-facs.y) + pts[1]*(1-facs.x)*facs.y + pts[2]*facs.x*(1-facs.y) + pts[3]*facs.x*facs.y;
+}
+
+import std.string, std.math;
+HdrTex* parseHDR(ubyte[] data, string fn) {
+  string asText = string:data;
+  auto res = new HdrTex;
+  int w, h;
+  bool running = true;
+  while (running) {
+    auto line = slice(&asText, "\n");
+    if (string rest = line.startsWith "-Y ") {
+      h = slice(&rest, " +X ").atoi();
+      w = rest.atoi();
+      running = false;
+      data = ubyte[]:asText;
+    }
+  }
+  writeln "Read $w x $h ($fn)";
+  res.data = new vec3f[] (w * h);
+  auto scanline = new ubyte x 4[] w;
+  alias takeNextChar = data[(0, 1..$)];
+  alias takeNextChar2 = data[(0, 1, 2..$)];
+  
+  for (int y <- 0..h) {
+    // writeln "Read line $y";
+    (int i, data) = takeNextChar;
+    void fail() { asm `int $3`; }
+    if (i != 2) fail;
+    (int grn, int blu, data) = takeNextChar2;
+    // writeln "grn $grn, blu $blu";
+    if (grn != 2 || blu & 128) fail;
+    (i, data) = takeNextChar;
+    // writeln "gives i $i -> $(blu << 8 | i) -> $(eval blu << 8 | i != w)";
+    if (blu << 8 | i != w) fail;
+    
+    for (int c <- 0..4) {
+      int j;
+      while j < w {
+        (int code, data) = takeNextChar;
+        if (code > 128) { // run
+          code &= 127;
+          (ubyte val, data) = takeNextChar;
+          while (code--)
+            scanline[j++][c] = val;
+        } else { // non-run
+          while (code--)
+            (scanline[j++][c], data) = takeNextChar;
+        }
+      }
+    }
+    
+    auto resline = res.data[y*w .. (y+1)*w];
+    for (int x <- 0..w) {
+      int
+        red = scanline[x][0],
+        green = scanline[x][1],
+        blue = scanline[x][2],
+        exp = scanline[x][3];
+      auto col = vec3f(red / 256f, green / 256f, blue / 256f) * pow(2, exp - 128);
+      float len = |col|;
+      if (len > 1) { float newlen = pow((len - 1) + 1, 4); col *= (newlen / len); }
+      resline[x] = col * 8;
+    }
+  }
+  res.(w, h) = (w, h);
+  return res;
+}

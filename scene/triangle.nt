@@ -1,30 +1,6 @@
 module scene.triangle;
 
-import scene.base, gd;
-
-void init() {
-  // auto file = import("teabake_tex.jpg");
-  // texptr = gdImageCreateFromJpegPtr(file.(length, ptr));
-  // auto file = import("testsurf.png");
-  // texptr = gdImageCreateFromPngPtr(file.(length, ptr));
-}
-
-vec3f lookup(int x, y, void* texptr) {
-  auto gdp = gdImagePtr:texptr;
-  int res = gdp.tpixels[y%gdp.sy][x%gdp.sx];
-  return vec3f((res>>16)&0xff, (res>>8)&0xff, (res>>0)&0xff) / 256;
-}
-
-vec3f interpolate(float u, v, void* texptr) {
-  // (u, v) = (v, u); // WHAAAT
-  auto gdp = gdImagePtr:texptr;
-  auto coord = vec2f(u, v) * vec2f(gdp.sx, gdp.sy);
-  auto icoord = vec2i(int:fastfloor coord.x, int:fastfloor coord.y);
-  auto pts = (lookup(icoord, texptr),         lookup(icoord+vec2i.Y,  texptr),
-              lookup(icoord+vec2i.X, texptr), lookup(icoord+vec2i(1), texptr));
-  auto facs = coord - vec2f(fastfloor coord.x, fastfloor coord.y);
-  return pts[0]*(1-facs.x)*(1-facs.y) + pts[1]*(1-facs.x)*facs.y + pts[2]*facs.x*(1-facs.y) + pts[3]*facs.x*facs.y;
-}
+import scene.base, scene.texture;
 
 class Triangle : SceneObject {
   vec3f a, ba, ca, n;
@@ -116,7 +92,7 @@ class Triangle : SceneObject {
 struct TriangleInfo {
   vec3f a, b, c, n;
   vec2f uv-a, uv-ba, uv-ca;
-  float invDenom; void* texture-state;
+  float invDenom; Texture* texture-state;
 }
 
 extern(C) int fast_rayHitsAABB(vec3f* abp, p_ray, float* dist);
@@ -285,7 +261,7 @@ extern(C) void fast_triangle_recurse(TriangleNode *node, vec3f* pos, dir, Triang
 class TriangleSet : SceneObject {
   TriangleNode* root;
   void init() { root = new TriangleNode; }
-  void addTriangle(vec3f a, vec2f atex, vec3f b, vec2f btex, vec3f c, vec2f ctex, void* texptr) {
+  void addTriangle(vec3f a, vec2f atex, vec3f b, vec2f btex, vec3f c, vec2f ctex, Texture* texptr) {
     TriangleInfo ti;
     ti.(a, b, c, uv-a, uv-ba, uv-ca) = (a, b, c, atex, btex - atex, ctex - atex);
     ti.texture-state = texptr;
@@ -310,7 +286,7 @@ class TriangleSet : SceneObject {
   }
   void flatten() {
     auto size = int:root.linearAllocate();
-    writeln "full slab size = $size";
+    // writeln "full slab size = $size";
     void* ptr = aligned_calloc size;
     root = TriangleNode*: root.linearAllocate(&ptr);
   }

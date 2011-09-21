@@ -6,7 +6,7 @@ import std.boehm;
 import
   scene.checkerpattern, scene.group, scene.plane, scene.scale,
   scene.sphere, scene.translate, scene.triangle, scene.util,
-  scene.color, scene.base, scene.bound;
+  scene.color, scene.base, scene.bound, scene.envmap, scene.texture;
 
 alias EPS = 0.999;
 
@@ -16,10 +16,12 @@ extern(C) {
 }
 
 import gd;
-gdImagePtr readGd(string fname) {
+Texture* readImage(string fname) {
+  auto res = new Texture;
   auto fdata = readAll fname;
-  if (fname.toLower().endsWith ".jpg") return gdImageCreateFromJpegPtr(fdata.(length, ptr));
-  if (fname.toLower().endsWith ".png") return gdImageCreateFromPngPtr(fdata.(length, ptr));
+  if (fname.toLower().endsWith ".jpg") { res.gdp = gdImageCreateFromJpegPtr(fdata.(length, ptr)); return res; }
+  if (fname.toLower().endsWith ".png") { res.gdp = gdImageCreateFromPngPtr(fdata.(length, ptr)); return res; }
+  if (fname.toLower().endsWith ".hdr") { res.hdp = parseHDR(fdata, fname); return res; }
   raise-error new Error "Unknown extension in '$fname'! ";
 }
 
@@ -279,9 +281,9 @@ void main(string[] args) {
     alias mtlfile = objfile.replace(".obj", ".mtl");
     auto mtl = string: import(mtlfile) #.split "\n";
     
-    (string, void*)[auto~] matcache;
-    void* lookupMatl(string matname) {
-      for (string name, void* data) <- matcache if name == matname return data;
+    (string, Texture*)[auto~] matcache;
+    Texture* lookupMatl(string matname) {
+      for (string name, Texture* data) <- matcache if name == matname return data;
       bool inSection;
       auto firstmatch = "newmtl $matname";
       string fname;
@@ -297,15 +299,13 @@ void main(string[] args) {
         writeln "No texture found for $matname! ";
         return null;
       } else {
-        auto data = readGd fname;
-        writeln "Read image: $matname => $fname";
-        if (data) writeln "($(data.sx), $(data.sy))";
-        matcache ~= (matname, void*:data);
+        auto data = readImage fname;
+        // writeln "Read image: $matname => $fname";
+        matcache ~= (matname, data);
         return data;
       }
     }
     
-    alias mew = string;
     string[] selectAs(string delegate(string) dg) {
       string[auto~] res;
       for auto line <- obj if auto thing = dg line res ~= thing;
@@ -322,13 +322,13 @@ void main(string[] args) {
     auto texcoords = [for array <- [auto~for v <- selectAs(delegate string(string s) return s.startsWith "vt ";): [auto~for part <- v.split " ": std.string.atof part].eval[]]: vec2f_and_free array].eval[];
     onSuccess { vertices.free; texcoords.free; }
     auto fusemtl = selectOn(delegate bool(string s) return eval s.startsWith "f " || s.startsWith "usemtl "; );
-    void* currentTexture;
+    Texture* currentTexture;
     auto currentSet = new TriangleSet;
     void flush() {
-      writeln "aabb = $(currentSet.root.aabb.a), $(currentSet.root.aabb.b)";
+      // writeln "aabb = $(currentSet.root.aabb.a), $(currentSet.root.aabb.b)";
       if (currentSet.root.aabb.a.y < lowest) lowest = currentSet.root.aabb.a.y;
       currentSet.optimize;
-      writeln "Tree optimized";
+      // writeln "Tree optimized";
       list ~= currentSet;
       bb.addBox(currentSet.root.aabb.(a, b));
       currentSet = new TriangleSet;
@@ -363,7 +363,8 @@ void main(string[] args) {
   using new Group {
     // list ~= new CheckerPattern(vec3f(0, 1, 0), vec3f(0, 0, 1), new Plane(vec3f(0, 1, 0), vec3f(0, 0, 0)));
     list ~= new Scale(1/10.0, new CheckerPattern(vec3f(1, 0.95, 0.8), vec3f(0.8, 0.95, 1), new Plane(vec3f(0, 1, 0), vec3f(0, 0, 0))));
-    list ~= new Shine(vec3f(1.2, 1.23, 1.3), new Plane(vec3f(0, -1, 0), vec3f(0, 100, 0)));
+    // list ~= new Shine(vec3f(1.2, 1.23, 1.3) * 6, new Plane(vec3f(0, -1, 0), vec3f(0, 100, 0)));
+    list ~= new EnvMap readImage "OpenfootageNET_Beach_CavalinoItalylow.hdr";
     // list ~= new Translate(vec3f(0, 0, 5), new Scale(0.2, new CheckerPattern(vec3f(0, 1, 0), vec3f(1, 0, 0), new Sphere(vec3f(0, 0, 0), 10))));
     // list ~= new Translate(vec3f(0, 0, 5), new Scale(2.5, new Triangle(vec3f(-1, 0.1, -1), vec3f(-1, 0.1, 1), vec3f(1, 0.1, -1))));
     list ~= new Translate(vec3f(1, -lowest / 25, 5), new Scale(vec3f(-1/25.0, 1/25.0, -1/25.0), object));
@@ -417,7 +418,7 @@ void main(string[] args) {
   stream ~= CommandHandler: null; // terminator
   int rays-needed = stats.rays-needed-max;
   int results-needed = stats.results-needed-max;
-  writeln "($rays-needed, $results-needed): $(stream[0..$-1])";
+  writeln "($rays-needed, $results-needed): $(stream[0..$-1].length)";
   writeln "steps: $(stream.length - 1)";
   
   auto start = sec(), firststart = start;

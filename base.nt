@@ -19,12 +19,23 @@ void assert(bool b, string s) {
   if (!s) raise-error new AssertError s;
 }
 
+struct HdrTex {
+  int w, h;
+  vec3f[] data;
+}
+
+import gd;
+struct Texture {
+  gdImagePtr gdp;
+  HdrTex* hdp;
+}
+
 struct Result {
   float distance;
   vec3f normal;
   vec3f reflective-color, emissive-color;
   alias col = reflective-color;
-  vec2f texcoord; void* texinfo;
+  vec2f texcoord; Texture* texinfo;
   bool success;
   string toString() {
     if (success) {

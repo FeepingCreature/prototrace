@@ -1,0 +1,36 @@
+module scene.envmap;
+
+import scene.base, scene.texture;
+
+class EnvMap : SceneObject {
+  void* tex;
+  void init(void* tex) { this.tex = tex; }
+  bool collide(Ray* ray, Result* res) { raise-error new Error "EnvMap::collide not implemented! "; }
+  void process(VMState[] list) {
+    for int i <- 0..list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      using sp mixin(allocResult);
+      auto res = sp.result;
+      auto dir = sp.ray.dir;
+      
+      float angle1 = atan2(dir.z, dir.x);
+      float angle2 = atan2(-dir.y, sqrt(dir.(x*x+z*z)));
+      
+      angle1 = (angle1 + PI) / (PI * 2);
+      angle2 = (angle2 + PI/2) / PI;
+      
+      res.success = true;
+      res.distance = float.infinity;
+      res.emissive-color = interpolate(angle1, angle2, tex);
+      res.reflective-color = vec3f(0);
+    }
+  }
+  CommandHandler[] buildCommandStream(VMStats* stats) {
+    stats.results-needed-cur ++;
+    return CommandHandler[]:null ~ this;
+  }
+}

@@ -87,3 +87,17 @@ class FreeRay : CommandHandler {
     }
   }
 }
+
+class CopyRay : CommandHandler {
+  void process(VMState[] list) {
+    for int i <- 0 .. list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      using sp mixin(allocRay);
+      *sp.ray = sp.rays[$-2];
+    }
+  }
+}

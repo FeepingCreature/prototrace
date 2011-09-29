@@ -7,9 +7,11 @@ struct VMState {
   
   Ray* ray-stack;
   alias ray = &ray-stack[ray-id - 1];
+  alias rays = ray-stack[0 .. ray-id];
   
   Result* result-stack;
   alias result = &result-stack[result-id - 1];
+  alias results = result-stack[0 .. result-id];
   
   CommandHandler[] stream;
   

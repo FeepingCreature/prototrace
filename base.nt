@@ -11,14 +11,6 @@ struct Ray {
   string toString() return "[$pos + k $dir]";
 }
 
-class AssertError : Error {
-  void init(string s) { super.init "Assertion failed: $s"; }
-}
-
-void assert(bool b, string s) {
-  if (!s) raise-error new AssertError s;
-}
-
 struct HdrTex {
   int w, h;
   vec3f[] data;
@@ -44,6 +36,16 @@ struct Result {
       return "[res: no hit]";
     }
   }
+}
+
+vec3f evaluateRay(Ray[] steps, Result[] hits) {
+  vec3f res = vec3f(0);
+  assert(steps.length == hits.length);
+  for (int i = steps.length - 1; i >= 0; --i) {
+    if (!hits[i].success) res = vec3f(0);
+    else res = hits[i].(reflective-color * res + emissive-color);
+  }
+  return res;
 }
 
 interface CommandHandler;

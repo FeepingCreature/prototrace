@@ -21,7 +21,7 @@ class Sphere : SceneObject {
       k1 = k + sq,
       k2 = k - sq;
     if (k1 < 0) return false;
-    res.distance = [k1, k2][eval k2 > 0];
+    res.distance = [k1, k2][k2 > 0];
     res.col = vec3f(1);
     {
       vec3f normal = ray.(pos + dir * res.distance) - center;
@@ -72,7 +72,7 @@ class Sphere : SceneObject {
       else using res::
       success = true;
       
-      distance = [k1, k2][eval k2 > 0];
+      distance = [k1, k2][k2 > 0];
       col = vec3f(1);
       vec3f normal = sp.ray.(pos + dir * distance) - center;
       that.normal = normal / vec3f(|normal|);

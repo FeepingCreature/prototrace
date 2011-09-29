@@ -12,7 +12,7 @@ class CheckerPattern : SceneObject {
     if (!sup.collide(ray, res)) return false;
     auto hitpos = ray.(pos + dir * res.distance);
     auto hitpos_int = vec3i((hitpos).(int:x & 1, int:y & 1, int:z & 1));
-    bool checker = eval (hitpos_int.x xor hitpos_int.y xor hitpos_int.z);
+    bool checker = hitpos_int.x xor hitpos_int.y xor hitpos_int.z;
     res.col = [a, b][checker];
     return true;
   }
@@ -28,7 +28,7 @@ class CheckerPattern : SceneObject {
       auto res = sp.result;
       if (res.success) {
         auto hitpos = sp.ray.(pos + dir * res.distance);
-        bool checker = eval ((int:hitpos.x & 1) xor (int:hitpos.y & 1) xor (int:hitpos.z & 1));
+        bool checker = (int:hitpos.x & 1) xor (int:hitpos.y & 1) xor (int:hitpos.z & 1);
         res.col = [a, b][checker];
       }
     }

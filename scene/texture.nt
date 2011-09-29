@@ -53,7 +53,7 @@ HdrTex* parseHDR(ubyte[] data, string fn) {
     // writeln "grn $grn, blu $blu";
     if (grn != 2 || blu & 128) fail;
     (i, data) = takeNextChar;
-    // writeln "gives i $i -> $(blu << 8 | i) -> $(eval blu << 8 | i != w)";
+    // writeln "gives i $i -> $(blu << 8 | i) -> $(blu << 8 | i != w)";
     if (blu << 8 | i != w) fail;
     
     for (int c <- 0..4) {

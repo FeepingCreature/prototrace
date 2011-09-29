@@ -13,6 +13,8 @@ alias EPS = 0.999;
 extern(C) {
   void fastsetup(int xfrom, xto, yfrom, yto, dw, dh, VMState*);
   void fast_light_process(VMState*, int numstates, vec3f* lightpos, void* self);
+  void coords_to_ray(int xfrom, xto, yfrom, yto, dw, dh, int x, int y, Ray* rayp);
+  void ray_to_coords(int dw, dh, Ray* rayp, int* xp, int* yp);
 }
 
 import gd;
@@ -247,6 +249,116 @@ class PathTraceLighting : SceneObject {
   }
 }
 
+void delegate(Ray* rayp, vec3f col) recordResultDg;
+
+class RecordResultStep : CommandHandler {
+  int skipRays, skipResults;
+  void init(int skRay = 0, skRes = 0) (skipRays, skipResults) = (skRay, skRes);
+  void process(VMState[] list) {
+    for int i <- 0 .. list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      recordResultDg (&sp.ray-stack[skipRays], evaluateRay(sp.rays[skipRays .. $], sp.results[skipResults .. $]));
+    }
+  }
+}
+
+class MetropolisLighting : SceneObject {
+  SceneObject sup; int samples, depth;
+  void init(SceneObject sup) this.(sup, depth, samples) = (sup, 3, 16);
+  void init(SceneObject sup, int dep, int samples) this.(sup, depth, samples) = (sup, dep, samples);
+  class MetropolisStep : CommandHandler {
+    int stepsToRewind;
+    class MetropolisSkipNoOp : CommandHandler {
+      void process(VMState[] list) {
+        for int i <- 0 .. list.length {
+          auto sp = &list[i];
+          
+          if (void*:sp.handler == void*:CommandHandler:this)::
+          sp.stream = sp.stream[1..$];
+          using sp mixin(freeRay.replace("!!", "2"));
+          using sp mixin(freeResult.replace("!!", "2"));
+        }
+      }
+    }
+    
+    CommandHandler mkTestRaySelector() {
+      return new MetropolisSkipNoOp;
+    }
+    CommandHandler mkTestRaySelector2() {
+      return new MetropolisSkipNoOp;
+    }
+    void process(VMState[] list) {
+      for int i <- 0 .. list.length {
+        auto sp = &list[i];
+        
+        if (void*:sp.handler == void*:CommandHandler:this)::
+        sp.stream = sp.stream[1..$];
+        // do nothing much yet
+        for 0..2 {
+          using sp mixin(freeRay.replace("!!", "1"));
+          using sp mixin(freeResult.replace("!!", "1"));
+        }
+      }
+    }
+  }
+  CommandHandler[] buildCommandStream(VMStats* stats) {
+    CommandHandler[auto~] res;
+    
+    for (0..samples) {
+      auto startinfo = stats.(rays-needed-cur, results-needed-cur);
+      int i = 1;
+      res ~= new CopyRay;
+      stats.rays-needed-cur ++;
+      PathTraceStep lastPTStep;
+      do {
+        auto stream = sup.buildCommandStream(stats);
+        if (lastPTStep) lastPTStep.skip = stream.length;
+        res ~= stream;
+      } while (i++ < depth) {
+        // build initial path
+        using new PathTraceStep(0) {
+          lastPTStep = that;
+          res ~= that;
+          stats.rays-needed-cur ++;
+        }
+      }
+      // ^
+      // res += depth
+      // rays += depth
+      int rewindpos = res.length;
+      res ~= new RecordResultStep(1);
+      using new MetropolisStep {
+        res ~= mkTestRaySelector();
+        stats.rays-needed-cur ++;
+        res ~= sup.buildCommandStream(stats); // results ++
+        res ~= mkTestRaySelector2();
+        stats.rays-needed-cur ++;
+        res ~= sup.buildCommandStream(stats); // results ++
+        
+        stepsToRewind = res.length - rewindpos;
+        
+        res ~= that;
+        
+        stats.rays-needed-cur -= 2;
+        stats.results-needed-cur -= 2;
+      }
+      auto fr = new FreeRay, fs = new FreeResult;
+      for 0..depth {
+        res ~= fr;
+        res ~= fs;
+      }
+      stats.rays-needed-cur -= depth;
+      stats.results-needed-cur -= depth;
+      assert(eval stats.(rays-needed-cur == startinfo[0] && results-needed-cur == startinfo[1]), "Ray/res allocation mismatch! ");
+    }
+    return res[];
+  }
+}
+
 import std.time, std.file;
 import c.fenv;
 extern(C) { void GC_disable(); void GC_gcollect(); void GC_enable(); }
@@ -373,7 +485,7 @@ void main(string[] args) {
   
   vec3f lightpos;
   
-  float desired-fps = 1;
+  float desired-fps = 18;
   for auto arg <- args if auto rest = arg.startsWith "-fps=" desired-fps = std.string.atof rest;
   float lightrot = 1.43;
   for auto arg <- args if auto rest = arg.startsWith "-lightrot=" lightrot = std.string.atof rest;
@@ -403,11 +515,12 @@ void main(string[] args) {
   vec2f getScale() {
     return 2.0f * vec2f(ratio, 1) / vec2f(desired-display-size);
   }
-  if (jitter) {
-    scene = new AverageResults(samples, new JitterRay(&getScale, new PathTraceLighting(scene, new PathTraceLighting (scene, new PathTraceLighting scene))));
-  } else {
-    scene = new PathTraceLighting(samples, scene, new PathTraceLighting (scene, new PathTraceLighting scene));
-  }
+  // if (jitter) {
+    // scene = new AverageResults(samples, new JitterRay(&getScale, new PathTraceLighting(scene, new PathTraceLighting (scene, new PathTraceLighting scene))));
+  // } else {
+    // scene = new PathTraceLighting(samples, scene, new PathTraceLighting (scene, new PathTraceLighting scene));
+  // }
+  scene = new MetropolisLighting(scene, 3, samples);
   
   vec4f[] resbuffer;
   
@@ -420,6 +533,7 @@ void main(string[] args) {
   int results-needed = stats.results-needed-max;
   writeln "($rays-needed, $results-needed): $(stream[0..$-1].length)";
   writeln "steps: $(stream.length - 1)";
+  writeln "Last 20: $(stream[$-21..$-1])";
   
   auto start = sec(), firststart = start;
   int iters; long rays;
@@ -435,6 +549,28 @@ void main(string[] args) {
     alias my-res-map = ray-res-vm-map[thread][1];
     alias my-vm-map = ray-res-vm-map[thread][2];
     int count = tilesize * tilesize;
+    
+    int xfrom = tile % (dw / tilesize) # * tilesize;
+    int yfrom = tile / (dw / tilesize) # * tilesize;
+    int xto = xfrom + tilesize, yto = yfrom + tilesize;
+    
+    using scoped recordResultDg::
+    recordResultDg = delegate void(Ray* rayp, vec3f col) {
+      int x, y;
+      ray_to_coords(dw, dh, rayp, &x, &y);
+      
+      int dx = x - xfrom, dy = y - yfrom;
+      if (dx < 0 || dy < 0 || dx > tilesize || dy > tilesize) {
+        writeln "$((dx, dy)) out of bounds! was: $((x, y)) due to $(rayp.pos) -> $(rayp.dir): $col";
+        writeln "pos @$(&rayp.pos)";
+        writeln "(and we are $((xfrom, yfrom)) .. $((xto, yto))";
+        // asm `int $3`;
+        return;
+      }
+      // writeln "result for $(rayp.pos) -> $(rayp.dir) transformed to $(dir) ($x, $y in $((xfrom, yfrom))..$((xto, yto))is $col";
+      // asm `int $3`;
+      resbuffer[(tile * tilesize + dy) * tilesize + dx] += vec4f(col.(x, y, z, 1));
+    };
     // split into subfunctions for the benefit of the profiler.
     void setup() {
       auto xstream = stream;
@@ -455,10 +591,6 @@ void main(string[] args) {
       Ray[] ray-slab = Ray*:align16(my-ray-map.ptr) #[0..my-ray-map.length - 1];
       Result[] res-slab = Result*:align16(my-res-map.ptr) #[0..my-res-map.length - 1];
       auto state = VMState*:align16(my-vm-map.ptr);
-      
-      int xfrom = tile % (dw / tilesize) # * tilesize;
-      int yfrom = tile / (dw / tilesize) # * tilesize;
-      int xto = xfrom + tilesize, yto = yfrom + tilesize;
       
       for (int y, int x) <- cross(yfrom..yto, xfrom..xto) {
         // float fx = x / (dw/2f) - 1f, fy = 1f - y / (dh/2f);
@@ -505,7 +637,8 @@ void main(string[] args) {
         if (!res.success) *rp = vec4f.W;
         else {
           *rp = res.emissive-color;
-          float maxf(float a, b) return [a, b][eval b > a];
+          // TODO: move color normalization into renderer?
+          float maxf(float a, b) return [a, b][b > a];
           if (rp.(maxf(x, maxf(y, z))) > 1)
             (*rp) /= rp.(maxf(x, maxf(y, z)));
           rp.w = 1;
@@ -515,7 +648,7 @@ void main(string[] args) {
     }
     setup();
     process();
-    finalize();
+    // finalize();
   }
   
   auto lp = new LoopPool threads;
@@ -605,12 +738,14 @@ void main(string[] args) {
         if (psq < 0.7) psq = 0.7;
         (int, int) updated-size = (int:(surf.w / psq), int:(surf.h / psq));
         updated-size = (updated-size[0] / 10 #* 10, updated-size[1] / 10 #* 10);
-        resbuffer-lock.lock-write();
-          desired-display-size = updated-size;
-          resbuffer.free;
-          resbuffer = new vec4f[] (updated-size[0] * updated-size[1]);
-          resbuffer[] = [for 0..resbuffer.length: vec4f.W];
-        resbuffer-lock.unlock();
+        if (updated-size[0] != desired-display-size[0] && updated-size[1] != desired-display-size[1]) {
+          resbuffer-lock.lock-write();
+            desired-display-size = updated-size;
+            resbuffer.free;
+            resbuffer = new vec4f[] (updated-size[0] * updated-size[1]);
+            resbuffer[] = [for 0..resbuffer.length: vec4f.W];
+          resbuffer-lock.unlock();
+        }
         // reset estimation
         iters = 0; start = sec();
       }
@@ -641,7 +776,11 @@ void main(string[] args) {
       int yfrom = tile / xtiles # * tilesize;
       int xto = xfrom + tilesize, yto = yfrom + tilesize;
       for (int y, int x) <- cross(yfrom .. yto, xfrom .. xto) {
-        surf.pset(x, y, resbuffer[k++].(xyz/w));
+        auto col = resbuffer[k++].(xyz/w);
+        float maxf(float a, b) return [a, b][b > a];
+        if (col.(maxf(x, maxf(y, z))) > 1)
+          col /= col.(maxf(x, maxf(y, z)));
+        surf.pset(x, y, col);
       }
     }
     resbuffer-lock.unlock();

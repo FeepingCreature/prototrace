@@ -13,9 +13,12 @@ alias EPS = 0.999;
 extern(C) {
   void fastsetup(int xfrom, xto, yfrom, yto, dw, dh, VMState*);
   void fast_light_process(VMState*, int numstates, vec3f* lightpos, void* self);
-  void coords_to_ray(int xfrom, xto, yfrom, yto, dw, dh, int x, int y, Ray* rayp);
+  void coords_to_ray(int dw, dh, int x, int y, Ray* rayp);
   void ray_to_coords(int dw, dh, Ray* rayp, int* xp, int* yp);
 }
+
+int dw, dh;
+alias tilesize = 10;
 
 import gd;
 Texture* readImage(string fname) {
@@ -272,24 +275,75 @@ class MetropolisLighting : SceneObject {
   void init(SceneObject sup, int dep, int samples) this.(sup, depth, samples) = (sup, dep, samples);
   class MetropolisStep : CommandHandler {
     int stepsToRewind;
-    class MetropolisSkipNoOp : CommandHandler {
+    class SkipNoOp : CommandHandler {
       void process(VMState[] list) {
         for int i <- 0 .. list.length {
           auto sp = &list[i];
           
           if (void*:sp.handler == void*:CommandHandler:this)::
           sp.stream = sp.stream[1..$];
-          using sp mixin(freeRay.replace("!!", "2"));
-          using sp mixin(freeResult.replace("!!", "2"));
+          using sp mixin(allocRay);
         }
       }
     }
     
-    CommandHandler mkTestRaySelector() {
-      return new MetropolisSkipNoOp;
+    class Mutate1 : CommandHandler {
+      int firstRay, firstRes;
+      void init(int firstId, firstResId) (firstRay, firstRes) = (firstId, firstResId);
+      void process(VMState[] list) {
+        for int i <- 0 .. list.length {
+          auto sp = &list[i];
+          
+          if (void*:sp.handler == void*:CommandHandler:this)::
+          sp.stream = sp.stream[1..$];
+          
+          auto ray = &sp.rays[firstRay];
+          
+          ray_to_coords(dw, dh, ray, &int x, &int y);
+          using sp mixin(allocRay);
+          int dx = x % tilesize, dy = y % tilesize;
+          int xfrom = x - dx * tilesize, yfrom = y - dy * tilesize;
+          
+          int dx2 = rand() % tilesize, dy2 = rand() % tilesize;
+          int newx = xfrom + dx2, newy = yfrom + dy2;
+          coords_to_ray(dw, dh, newx, newy, sp.ray);
+          // writeln "lens mutate $(*ray) to $(*sp.ray)";
+        }
+      }
     }
-    CommandHandler mkTestRaySelector2() {
-      return new MetropolisSkipNoOp;
+    
+    class Mutate2 : CommandHandler {
+      int firstRay, firstRes;
+      void init(int firstId, firstResId) (firstRay, firstRes) = (firstId, firstResId);
+      void process(VMState[] list) {
+        for int i <- 0 .. list.length {
+          auto sp = &list[i];
+          
+          if (void*:sp.handler == void*:CommandHandler:this)::
+          sp.stream = sp.stream[1..$];
+          
+          auto ray = sp.ray, res = sp.result;
+          auto oldray2 = &sp.rays[firstRay + 1];
+          auto oldres2 = &sp.results[firstRes + 1];
+          
+          using sp mixin(allocRay);
+          if (res.success)::
+          if (!oldres2.success) res.success = false;
+          else::
+          auto nuray = sp.ray;
+          nuray.pos = ray.(pos + res.distance * dir);
+          nuray.dir = (oldray2.(pos + dir * oldres2.distance) - nuray.pos).normalized;
+        }
+      }
+    }
+    
+    CommandHandler mkTestRaySelector(int baseRay, baseRes) {
+      // return new SkipNoOp;
+      return new Mutate1 (baseRay, baseRes);
+    }
+    CommandHandler mkTestRaySelector2(int baseRay, baseRes) {
+      // return new SkipNoOp;
+      return new Mutate2 (baseRay, baseRes);
     }
     void process(VMState[] list) {
       for int i <- 0 .. list.length {
@@ -298,10 +352,8 @@ class MetropolisLighting : SceneObject {
         if (void*:sp.handler == void*:CommandHandler:this)::
         sp.stream = sp.stream[1..$];
         // do nothing much yet
-        for 0..2 {
-          using sp mixin(freeRay.replace("!!", "1"));
-          using sp mixin(freeResult.replace("!!", "1"));
-        }
+        using sp mixin(freeRay.replace("!!", "2"));
+        using sp mixin(freeResult.replace("!!", "2"));
       }
     }
   }
@@ -312,6 +364,8 @@ class MetropolisLighting : SceneObject {
       auto startinfo = stats.(rays-needed-cur, results-needed-cur);
       int i = 1;
       res ~= new CopyRay;
+      int baseRay = stats.rays-needed-cur;
+      int baseRes = stats.results-needed-cur;
       stats.rays-needed-cur ++;
       PathTraceStep lastPTStep;
       do {
@@ -332,10 +386,10 @@ class MetropolisLighting : SceneObject {
       int rewindpos = res.length;
       res ~= new RecordResultStep(1);
       using new MetropolisStep {
-        res ~= mkTestRaySelector();
+        res ~= mkTestRaySelector(baseRay, baseRes);
         stats.rays-needed-cur ++;
         res ~= sup.buildCommandStream(stats); // results ++
-        res ~= mkTestRaySelector2();
+        res ~= mkTestRaySelector2(baseRay, baseRes);
         stats.rays-needed-cur ++;
         res ~= sup.buildCommandStream(stats); // results ++
         
@@ -538,13 +592,11 @@ void main(string[] args) {
   auto start = sec(), firststart = start;
   int iters; long rays;
   
-  alias tilesize = 10;
-  
   auto ray-res-vm-map = new (Ray[], Result[], VMState[])[] threads;
   void* align16(void* v) { return void*:(int:v + 15 #&-16); }
   void render(int thread, int tile) {
     lightpos = vec3f(sin(lightrot) * 10 - 5, 5, cos(lightrot) * 10);
-    (int dw, int dh) = desired-display-size;
+    (dw, dh) = desired-display-size;
     alias my-ray-map = ray-res-vm-map[thread][0];
     alias my-res-map = ray-res-vm-map[thread][1];
     alias my-vm-map = ray-res-vm-map[thread][2];
@@ -701,7 +753,7 @@ void main(string[] args) {
   
   auto resbuffer-lock = new ReadWriteLock;
   
-  auto surf = screen(600, 600, surface => true);
+  auto surf = screen(512, 300, surface => true);
   desired-display-size = surf.(w, h);
   
   resbuffer = new vec4f[] surf.(w * h);

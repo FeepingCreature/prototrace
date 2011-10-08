@@ -32,42 +32,7 @@ typedef float v4sf __attribute__ ((vector_size (16)));
 typedef int v4si __attribute__ ((vector_size (16)));
 
 #define ALIGNED __attribute__ ((force_align_arg_pointer))
-
-void ALIGNED fastsetup(int xfrom, int xto, int yfrom, int yto, int dw, int dh, struct VMState* state) {
-  float ratio = dw * 1.0f / dh;
-  for (int y = yfrom; y < yto; ++y) {
-    for (int x = xfrom; x < xto; ++x) {
-      state->resid = 0;
-      state->rayid = 1;
-      float fx = x, fy = y;
-      // use dedicated step for this
-      // if (jitter) { fx += neat_randf(randfparam) - 0.5; fy += neat_randf(randfparam) - 0.5; }
-      v4sf v = (v4sf) {ratio * (fx / (dw / 2.0) - 1.0), 1.0 - fy / (dh / 2.0), 1.0, 0.0};
-      v4sf res = v;
-      // v = v * v
-      v *= v;
-      // res /= sqrt(v + v.yy + v.zz)
-      float f = 1.0f / sqrtf(*(float*) &v + *((float*) &v + 1) + *((float*) &v + 2));
-      /*v = __builtin_ia32_rsqrtss(
-        v + __builtin_ia32_shufps(v, v, 0x55)
-          + __builtin_ia32_shufps(v, v, 0xaa)
-      );
-      res *= __builtin_ia32_shufps(v, v, 0x0);*/
-      res *= (v4sf) {f, f, f, f};
-      *(v4sf*)&state->rays_ptr->dir = res;
-      *(v4sf*)&state->rays_ptr->pos = (v4sf){0,2,0,0};
-      state ++;
-    }
-  }
-}
-
 #define FOUR(x){x,x,x,x}
-
-#define SUM(vec) \
-  ((vec)\
-     + __builtin_ia32_shufps((vec), (vec), 0x55)\
-     + __builtin_ia32_shufps((vec), (vec), 0xaa)\
-  )
 #define X(vec) __builtin_ia32_vec_ext_v4sf ((vec), 0)
 #define Y(vec) __builtin_ia32_vec_ext_v4sf ((vec), 1)
 #define Z(vec) __builtin_ia32_vec_ext_v4sf ((vec), 2)
@@ -76,6 +41,46 @@ void ALIGNED fastsetup(int xfrom, int xto, int yfrom, int yto, int dw, int dh, s
 #define IY(vec) __builtin_ia32_vec_ext_v4si ((vec), 1)
 #define IZ(vec) __builtin_ia32_vec_ext_v4si ((vec), 2)
 #define IW(vec) __builtin_ia32_vec_ext_v4si ((vec), 3)
+
+void ALIGNED coords_to_ray(int dw, int dh, int x, int y, struct Ray *rayp) {
+  float ratio = dw * 1.0f / dh;
+  v4sf v = (v4sf) {ratio * ((float) x / (dw / 2.0) - 1.0), 1.0 - (float) y / (dh / 2.0), 1.0, 0.0};
+  v4sf res = v;
+  v *= v;
+  float f = 1.0f / sqrtf(*(float*) &v + *((float*) &v + 1) + *((float*) &v + 2));
+  
+  res *= (v4sf) FOUR(f);
+  *(v4sf*) &rayp->pos = (v4sf) {0,2,0,0};
+  *(v4sf*) &rayp->dir = (v4sf) res;
+}
+
+void ALIGNED ray_to_coords(int dw, int dh, struct Ray *rayp, int *xp, int *yp) {
+  float ratio = dw * 1.0f / dh;
+  v4sf dir = *(v4sf*) &rayp->dir;
+  dir /= (v4sf) FOUR(Z(dir)); // renormalize
+  int x = (int) (((1.0f + (X(dir) / ratio)) / 2.0f) * dw + 0.5);
+  int y = (int) (((1.0f - Y(dir)) / 2.0f) * dh + 0.5);
+  *xp = x;
+  *yp = y;
+}
+
+void ALIGNED fastsetup(int xfrom, int xto, int yfrom, int yto, int dw, int dh, struct VMState *state) {
+  float ratio = dw * 1.0f / dh;
+  for (int y = yfrom; y < yto; ++y) {
+    for (int x = xfrom; x < xto; ++x) {
+      state->resid = 0;
+      state->rayid = 1;
+      coords_to_ray(dw, dh, x, y, state->rays_ptr);
+      state ++;
+    }
+  }
+}
+
+#define SUM(vec) \
+  ((vec)\
+     + __builtin_ia32_shufps((vec), (vec), 0x55)\
+     + __builtin_ia32_shufps((vec), (vec), 0xaa)\
+  )
 // benched as fastest
 // TODO: rebench
 // #define XSUM(vec) X(SUM(vec))

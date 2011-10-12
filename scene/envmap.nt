@@ -4,7 +4,8 @@ import scene.base, scene.texture;
 
 class EnvMap : SceneObject {
   void* tex;
-  void init(void* tex) { this.tex = tex; }
+  float radius; // NOT infinity!
+  void init(void* tex, float rad) { this.tex = tex; radius = rad; }
   bool collide(Ray* ray, Result* res) { raise-error new Error "EnvMap::collide not implemented! "; }
   void process(VMState[] list) {
     for int i <- 0..list.length {
@@ -24,7 +25,7 @@ class EnvMap : SceneObject {
       angle2 = (angle2 + PI/2) / PI;
       
       res.success = true;
-      res.distance = float.infinity;
+      res.distance = sp.ray.(radius - |pos| * (pos*dir).sum); // work THIS one out, future me!
       res.emissive-color = interpolate(angle1, angle2, tex);
       res.reflective-color = vec3f(0);
     }

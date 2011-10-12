@@ -28,6 +28,7 @@ struct Result {
   vec3f reflective-color, emissive-color;
   alias col = reflective-color;
   vec2f texcoord; Texture* texinfo;
+  int data;
   bool success;
   string toString() {
     if (success) {

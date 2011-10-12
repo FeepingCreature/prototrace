@@ -139,6 +139,18 @@ class JitterRay : SceneObject {
   }
 }
 
+void generateOutRay(Ray* ray, Ray* prev-ray, vec3f start, Result* resinfo) {
+  ray.(pos, dir) = (start, rand_sphere());
+  auto normal = resinfo.normal;
+  // flip the normal if we approached the surface from the "backside"
+  // this accounts for things like triangle models where a triangle may be visible from both sides
+  // on an unrelated note, fuck those bullshit models
+  if ((normal * prev-ray.dir).sum >= 0)
+    normal = -normal;
+  
+  if (ray.dir * normal).sum < 0 ray.dir = -ray.dir;
+}
+
 class PathTraceStep : CommandHandler {
   int skip, res-delta;
   void init(int s, int rd = 0) { skip = s; res-delta = rd; } 
@@ -171,14 +183,11 @@ class PathTraceStep : CommandHandler {
       
       using sp mixin(allocRay);
       
-      auto res = sp.(result-stack[result-id - 1 - res-delta]);
+      auto res = &sp.(result-stack[result-id - 1 - res-delta]);
       if (res.success && res.reflective-color != vec3f(0)) {
-        auto nspos = sp.(ray-stack[ray-id - 2]).(pos + dir * (res.distance * EPS));
+        auto nspos = sp.(rays[$-2]).(pos + dir * (res.distance * EPS));
         // writeln "nspos = $(ray.(pos, dir)) @ $(res.distance) = $(nspos)";
-        sp.ray.(pos, dir) = (nspos, rand_sphere());
-        auto norm = res.normal;
-        if ((norm * sp.(ray-stack[ray-id - 1].dir)).sum >= 0) norm = -norm;
-        if (sp.ray.dir * norm).(x+y+z) < 0 sp.ray.dir = -sp.ray.dir;
+        generateOutRay(sp.ray, &sp.rays[$-2], nspos, res);
       } else {
         using sp mixin(allocResult);
         sp.stream = sp.stream[skip .. $]; // no point
@@ -275,21 +284,10 @@ class MetropolisLighting : SceneObject {
   void init(SceneObject sup, int dep, int samples) this.(sup, depth, samples) = (sup, dep, samples);
   class MetropolisStep : CommandHandler {
     int stepsToRewind;
-    class SkipNoOp : CommandHandler {
-      void process(VMState[] list) {
-        for int i <- 0 .. list.length {
-          auto sp = &list[i];
-          
-          if (void*:sp.handler == void*:CommandHandler:this)::
-          sp.stream = sp.stream[1..$];
-          using sp mixin(allocRay);
-        }
-      }
-    }
-    
+    int firstRay, firstRes, skip;
     class Mutate1 : CommandHandler {
-      int firstRay, firstRes;
-      void init(int firstId, firstResId) (firstRay, firstRes) = (firstId, firstResId);
+      int firstRay, firstRes, skip;
+      void init(int firstId, firstResId, skipLen) (firstRay, firstRes, skip) = (firstId, firstResId, skipLen);
       void process(VMState[] list) {
         for int i <- 0 .. list.length {
           auto sp = &list[i];
@@ -299,22 +297,48 @@ class MetropolisLighting : SceneObject {
           
           auto ray = &sp.rays[firstRay];
           
-          ray_to_coords(dw, dh, ray, &int x, &int y);
-          using sp mixin(allocRay);
-          int dx = x % tilesize, dy = y % tilesize;
-          int xfrom = x - dx * tilesize, yfrom = y - dy * tilesize;
-          
-          int dx2 = rand() % tilesize, dy2 = rand() % tilesize;
-          int newx = xfrom + dx2, newy = yfrom + dy2;
-          coords_to_ray(dw, dh, newx, newy, sp.ray);
+          if (rand() & 1) {
+            // do a lens mutation
+            ray_to_coords(dw, dh, ray, &int x, &int y);
+            using sp mixin(allocRay);
+            int dx = x % tilesize, dy = y % tilesize;
+            int xfrom = x - dx, yfrom = y - dy;
+            
+            int dx2 = rand() % tilesize, dy2 = rand() % tilesize;
+            int newx = xfrom + dx2, newy = yfrom + dy2;
+            coords_to_ray(dw, dh, newx, newy, sp.ray);
+            sp.results[firstRes].data = 0; // lens mutation in progress
+          } else {
+            // do a tail mutation
+            // first, find the terminating ray 
+            auto res = &sp.results[firstRes];
+            // walk until termination ceases
+            int ray_offset;
+            while (res.success && res.reflective-color != vec3f(0)) {
+              res ++;
+              ray ++;
+              ray_offset ++;
+            }
+            using sp mixin(allocRay);
+            // "ray" now points at the last ray in the chain
+            if (ray_offset && res.success /* hit the environment */) {
+              res --; // the result it started from
+              generateOutRay(sp.ray, ray - 1, ray.pos, res);
+              sp.results[firstRes].data = ray_offset + 1;
+            } else {
+              // direct environment hit, nothing to do
+              using sp mixin(allocResult); // because skipping
+              sp.stream = sp.stream[skip .. $];
+            }
+          }
           // writeln "lens mutate $(*ray) to $(*sp.ray)";
         }
       }
     }
     
     class Mutate2 : CommandHandler {
-      int firstRay, firstRes;
-      void init(int firstId, firstResId) (firstRay, firstRes) = (firstId, firstResId);
+      int firstRay, firstRes, skip;
+      void init(int firstId, firstResId, skipLen) (firstRay, firstRes, skip) = (firstId, firstResId, skipLen);
       void process(VMState[] list) {
         for int i <- 0 .. list.length {
           auto sp = &list[i];
@@ -322,6 +346,11 @@ class MetropolisLighting : SceneObject {
           if (void*:sp.handler == void*:CommandHandler:this)::
           sp.stream = sp.stream[1..$];
           
+          // skip if tail mutating 
+          if (sp.results[firstRes].data == 0 /* no second ray */) {
+            using sp { mixin(allocRay); mixin(allocResult); }
+            sp.stream = sp.stream[skip..$];
+          } else::
           auto ray = sp.ray, res = sp.result;
           auto oldray2 = &sp.rays[firstRay + 1];
           auto oldres2 = &sp.results[firstRes + 1];
@@ -332,18 +361,22 @@ class MetropolisLighting : SceneObject {
           else::
           auto nuray = sp.ray;
           nuray.pos = ray.(pos + res.distance * dir);
-          nuray.dir = (oldray2.(pos + dir * oldres2.distance) - nuray.pos).normalized;
+          nuray.dir = oldray2.(pos + dir * oldres2.distance) - nuray.pos;
+          if (nuray.dir.magnitude == 0) {
+            writeln "problem for $(*oldray2) @$(oldres2.distance) compared to $$*nuray";
+            nuray.dir = oldray2.dir; // hackaround
+            // _interrupt 3;
+          }
+          nuray.dir = nuray.dir.normalized;
         }
       }
     }
     
-    CommandHandler mkTestRaySelector(int baseRay, baseRes) {
-      // return new SkipNoOp;
-      return new Mutate1 (baseRay, baseRes);
+    CommandHandler mkTestRaySelector(int baseRay, baseRes, skip) {
+      return new Mutate1 (baseRay, baseRes, skip);
     }
-    CommandHandler mkTestRaySelector2(int baseRay, baseRes) {
-      // return new SkipNoOp;
-      return new Mutate2 (baseRay, baseRes);
+    CommandHandler mkTestRaySelector2(int baseRay, baseRes, skip) {
+      return new Mutate2 (baseRay, baseRes, skip);
     }
     void process(VMState[] list) {
       for int i <- 0 .. list.length {
@@ -351,7 +384,61 @@ class MetropolisLighting : SceneObject {
         
         if (void*:sp.handler == void*:CommandHandler:this)::
         sp.stream = sp.stream[1..$];
-        // do nothing much yet
+        auto res = &sp.results[firstRes];
+        // if this fails, the ray is over already
+        if (res.success && res.reflective-color != vec3f(0)) {
+          auto data = sp.results[firstRes].data;
+          bool retry;
+          void delegate() flipPath;
+          int tailOffset; // kept outside the if so that the flipPath closure works
+          if (data > 0) {
+            // writeln "CASE1: $(data - 1) tail mutate";
+            tailOffset = data - 1;
+            auto res1 = sp.results[$-1];
+            if (res1.reflective-color != vec3f(0)) {
+              retry = true; // not part of the environment :(
+            } else {
+              flipPath = delegate void() {
+                sp.rays[(firstRay + tailOffset, $-2)] = sp.rays[($-2, firstRay + tailOffset)];
+                sp.results[(firstRes + tailOffset, $-2)] = sp.results[($-2, firstRes + tailOffset)];
+              };
+            }
+          } else {
+            // writeln "CASE2: lens mutate";
+            auto res1 = &sp.results[firstRes + 1];
+            auto res2 = &sp.results[$-1];
+            retry = true;
+            if (res1.success && res1.reflective-color != vec3f(0) &&
+                res2.success && res2.reflective-color != vec3f(0))::
+            auto cpt1 = sp.rays[firstRay + 1].(pos + dir * res1.distance);
+            auto cpt2 = sp.rays[$-1].(pos + dir * res2.distance);
+            auto delta = |cpt1 - cpt2|;
+            // scale by min distance traversed; smooth out rounding errors
+            if (res1.distance != 0 && res2.distance != 0)::
+            delta /= [res1.distance, res2.distance][res2.distance < res1.distance];
+            // connect the ray and rewind
+            // writeln "collision pt 1{$(cpt1)} 2{$(cpt2)} delta $(delta) {* $([res1.distance, res2.distance][res2.distance < res1.distance])}";
+            if (delta < 0.001) {
+              retry = false;
+              flipPath = delegate void() {
+                sp.rays[(firstRay, $-2)] = sp.rays[($-2, firstRay)];
+                sp.rays[(firstRay + 1, $-1)] = sp.rays[($-1, firstRay + 1)];
+                sp.results[(firstRes, $-2)] = sp.results[($-2, firstRes)];
+                sp.results[(firstRes + 1, $-1)] = sp.results[($-1, firstRes + 1)];
+              };
+            }
+          }
+          if (rand() % 100 < 99) {
+            if (retry) {
+              // don't record result, don't do metropolis
+              sp.stream = sp.stream.ptr[-stepsToRewind + 1 .. sp.stream.length];
+            } else {
+              // metropolis happens here
+              flipPath();
+              sp.stream = sp.stream.ptr[-stepsToRewind .. sp.stream.length];
+            }
+          }
+        }
         using sp mixin(freeRay.replace("!!", "2"));
         using sp mixin(freeResult.replace("!!", "2"));
       }
@@ -366,11 +453,14 @@ class MetropolisLighting : SceneObject {
       res ~= new CopyRay;
       int baseRay = stats.rays-needed-cur;
       int baseRes = stats.results-needed-cur;
+      int baseSkip;
+      alias baseTup = (baseRay, baseRes, baseSkip);
       stats.rays-needed-cur ++;
       PathTraceStep lastPTStep;
       do {
         auto stream = sup.buildCommandStream(stats);
         if (lastPTStep) lastPTStep.skip = stream.length;
+        baseSkip = stream.length;
         res ~= stream;
       } while (i++ < depth) {
         // build initial path
@@ -386,16 +476,17 @@ class MetropolisLighting : SceneObject {
       int rewindpos = res.length;
       res ~= new RecordResultStep(1);
       using new MetropolisStep {
-        res ~= mkTestRaySelector(baseRay, baseRes);
+        (firstRay, firstRes, skip) = baseTup;
+        res ~= mkTestRaySelector baseTup;
         stats.rays-needed-cur ++;
         res ~= sup.buildCommandStream(stats); // results ++
-        res ~= mkTestRaySelector2(baseRay, baseRes);
+        res ~= mkTestRaySelector2 baseTup;
         stats.rays-needed-cur ++;
         res ~= sup.buildCommandStream(stats); // results ++
-        
-        stepsToRewind = res.length - rewindpos;
         
         res ~= that;
+        
+        stepsToRewind = res.length - rewindpos;
         
         stats.rays-needed-cur -= 2;
         stats.results-needed-cur -= 2;
@@ -530,7 +621,7 @@ void main(string[] args) {
     // list ~= new CheckerPattern(vec3f(0, 1, 0), vec3f(0, 0, 1), new Plane(vec3f(0, 1, 0), vec3f(0, 0, 0)));
     list ~= new Scale(1/10.0, new CheckerPattern(vec3f(1, 0.95, 0.8), vec3f(0.8, 0.95, 1), new Plane(vec3f(0, 1, 0), vec3f(0, 0, 0))));
     // list ~= new Shine(vec3f(1.2, 1.23, 1.3) * 6, new Plane(vec3f(0, -1, 0), vec3f(0, 100, 0)));
-    list ~= new EnvMap readImage "OpenfootageNET_Beach_CavalinoItalylow.hdr";
+    list ~= new EnvMap (readImage "OpenfootageNET_Beach_CavalinoItalylow.hdr", 1_000_000);
     // list ~= new Translate(vec3f(0, 0, 5), new Scale(0.2, new CheckerPattern(vec3f(0, 1, 0), vec3f(1, 0, 0), new Sphere(vec3f(0, 0, 0), 10))));
     // list ~= new Translate(vec3f(0, 0, 5), new Scale(2.5, new Triangle(vec3f(-1, 0.1, -1), vec3f(-1, 0.1, 1), vec3f(1, 0.1, -1))));
     list ~= new Translate(vec3f(1, -lowest / 25, 5), new Scale(vec3f(-1/25.0, 1/25.0, -1/25.0), object));
@@ -539,7 +630,7 @@ void main(string[] args) {
   
   vec3f lightpos;
   
-  float desired-fps = 18;
+  float desired-fps = 0.5;
   for auto arg <- args if auto rest = arg.startsWith "-fps=" desired-fps = std.string.atof rest;
   float lightrot = 1.43;
   for auto arg <- args if auto rest = arg.startsWith "-lightrot=" lightrot = std.string.atof rest;

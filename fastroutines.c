@@ -17,6 +17,7 @@ struct Result {
   float distance;
   vec3f normal, col, emissive_col;
   vec2f texcoord; void *texinfo;
+  int data;
   int success;
 };
 

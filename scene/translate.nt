@@ -2,7 +2,7 @@ module scene.translate;
 
 import scene.base;
 
-extern(C) void fast_translate_process(VMState*, int numstates, vec3f vector, void* self);
+extern(C) void fast_translate_process(Ray**, Result**, VMState*, int numstates, vec3f vector, void* self);
 
 class Translate : SceneObject {
   vec3f vector;
@@ -27,7 +27,7 @@ class Translate : SceneObject {
     return sup.collide(&ray2, res);
   }
   void process(VMState[] list) {
-    fast_translate_process(list.ptr, list.length, vector, void*:CommandHandler:this);
+    fast_translate_process(rayplanes.ptr, resplanes.ptr, list.ptr, list.length, vector, void*:CommandHandler:this);
     return;
     for int i <- 0 .. list.length {
       auto sp = &list[i];
@@ -35,19 +35,15 @@ class Translate : SceneObject {
       if (void*:sp.handler == void*:CommandHandler:this)::
       sp.stream = sp.stream[1..$];
       
-      auto ray = sp.ray;
+      auto ray = &rayplanes[sp.ray-id-1][i];
       using sp mixin(allocRay);
-      sp.ray.(pos, dir) = ray.(pos - vector, dir);
+      rayplanes[sp.ray-id-1][i].(pos, dir) = ray.(pos - vector, dir);
     }
   }
   CommandHandler[] buildCommandStream(VMStats* stats) {
-    stats.rays-needed-cur ++;
+    stats.needsRay;
     auto res = CommandHandler[]:null ~ this ~ sup.buildCommandStream(stats) ~ new PostTranslate;
-    using stats {
-      if (rays-needed-cur > rays-needed-max)
-        rays-needed-max = rays-needed-cur;
-      rays-needed-cur --;
-    }
-   return res;
+    stats.rays-needed-cur --;
+    return res;
   }
 }

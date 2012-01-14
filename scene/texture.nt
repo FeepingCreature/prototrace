@@ -1,26 +1,74 @@
 module scene.texture;
 
-import base, gd;
+import scene.base, base, gd;
 
-vec3f lookup(int x, y, Texture* texptr) {
-  if (auto gdp = texptr.gdp) {
-    int res = gdp.tpixels[y%gdp.sy][x%gdp.sx];
-    return vec3f((res>>16)&0xff, (res>>8)&0xff, (res>>0)&0xff) / 256;
-  } else {
-    return texptr.hdp.(data[y * w + x]);
-  }
+extern(C) void interpolate(float u, v, Texture* tex, vec3f* outp);
+
+float ipow(float f, int i) {
+  if (i < 0) return 1f / ipow(f, -i);
+  else if (i == 0) return 1f;
+  else if (i == 1) return f;
+  else if (i == 2) return f * f;
+  else if (i & 1) { float f2 = ipow(f, i / 2); return f * f2 * f2; }
+  else { float f2 = ipow(f, i / 2); return f2 * f2; }
 }
 
-vec3f interpolate(float u, v, Texture* texptr) {
-  int w, h;
-  if (auto p = texptr.gdp) (w, h) = p.(sx, sy);
-  else (w, h) = texptr.hdp.(w, h);
-  auto coord = vec2f(u, v) * vec2f(w, h);
-  auto icoord = vec2i(int:fastfloor coord.x, int:fastfloor coord.y);
-  auto pts = (lookup(icoord, texptr),         lookup(icoord+vec2i.Y,  texptr),
-              lookup(icoord+vec2i.X, texptr), lookup(icoord+vec2i(1), texptr));
-  auto facs = coord - vec2f(fastfloor coord.x, fastfloor coord.y);
-  return pts[0]*(1-facs.x)*(1-facs.y) + pts[1]*(1-facs.x)*facs.y + pts[2]*facs.x*(1-facs.y) + pts[3]*facs.x*facs.y;
+static import c.math;
+int mylog2(float f) {
+  if (f < 0.0001f) return -128;
+  int res = int: c.math.floorf c.math.log2f f # + 1;
+  if (res < -128) return -128;
+  if (res > 127) assert(false);
+  return res;
+}
+
+byte[] encodeHDR(vec3f[] data, int w, h) {
+  byte[auto~] res;
+  res ~= byte[]:"#?RADIANCE\n";
+  res ~= byte[]:"# Made with ProtoTrace\n";
+  res ~= byte[]:"FORMAT=32-bit_rle_rgbe\n";
+  res ~= byte[]:"\n";
+  res ~= byte[]:"-Y $h +X $w\n";
+  auto scanline = new ubyte x 4[] w;
+  onSuccess scanline.free;
+  for (int y <- 0..h) {
+    // wth
+    res ~= byte:2; // i
+    res ~= byte:2; // grn
+    res ~= byte:(w >> 8);
+    res ~= byte:(w & 0xff);
+    // build scanline
+    auto line = data[y*w .. (y+1)*w];
+    for (int x <- 0..w) {
+      auto exp1 = mylog2(line[w - 1 - x].x), exp2 = mylog2(line[w - 1 - x].y), exp3 = mylog2(line[w - 1 - x].z);
+      auto exp = exp1.max(exp2).max(exp3);
+      if (exp == -128) {
+        scanline[x][(0, 1, 2, 3)] = byte:0 x 4;
+      } else {
+        auto rfactor = ipow(2, exp);
+        exp += 128;
+        assert(0 <= exp < 256);
+        auto vec = line[w - 1 - x] / rfactor;
+        scanline[x][0] = byte:int:c.math.floorf (vec.x * 256);
+        scanline[x][1] = byte:int:c.math.floorf (vec.y * 256);
+        scanline[x][2] = byte:int:c.math.floorf (vec.z * 256);
+        scanline[x][3] = byte:exp;
+      }
+    }
+    auto parts = scanline.length / 127, rem = scanline.length - parts * 127;
+    for (int c <- 0..4) {
+      int k;
+      for (int i <- 0..parts) {
+        res ~= byte:127;
+        for (0..127)
+          res ~= byte:scanline[k++][c];
+      }
+      res ~= byte:rem;
+      for (0..rem)
+        res ~= byte:scanline[k++][c];
+    }
+  }
+  return res[];
 }
 
 import std.string, std.math;
@@ -39,7 +87,7 @@ HdrTex* parseHDR(ubyte[] data, string fn) {
     }
   }
   writeln "Read $w x $h ($fn)";
-  res.data = new vec3f[] (w * h);
+  res.data = (vec3f*:aligned_calloc (w * h * size-of vec3f))[0..w*h];
   auto scanline = new ubyte x 4[] w;
   alias takeNextChar = data[(0, 1..$)];
   alias takeNextChar2 = data[(0, 1, 2..$)];
@@ -79,10 +127,10 @@ HdrTex* parseHDR(ubyte[] data, string fn) {
         green = scanline[x][1],
         blue = scanline[x][2],
         exp = scanline[x][3];
-      auto col = vec3f(red / 256f, green / 256f, blue / 256f) * pow(2, exp - 128);
+      auto col = vec3f(red / 256f, green / 256f, blue / 256f) * ipow(2, exp - 128);
       float len = |col|;
-      if (len > 1) { float newlen = pow((len - 1) + 1, 4); col *= (newlen / len); }
-      resline[x] = col * 8;
+      if (len > 1) { float newlen = ipow((len - 1) + 1, 5) * 1.5; col *= (newlen / len); }
+      resline[x] = col;
     }
   }
   res.(w, h) = (w, h);

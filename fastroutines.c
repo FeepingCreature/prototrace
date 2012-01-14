@@ -1,5 +1,7 @@
 #include "stdio.h"
 #include "math.h"
+#include "string.h"
+#include "gd.h"
 
 typedef struct {
   float x, y, z, w;
@@ -23,10 +25,14 @@ struct Result {
 
 struct VMState {
   int resid, rayid;
-  struct Ray *rays_ptr;
-  struct Result *res_ptr;
   int stream_len; void** stream_ptr;
-  int x, y;
+  
+  int state;
+  float state2;
+  int burnInCounter;
+  
+  vec3f rayCache;
+  int cached, cachedBack;
 };
 
 typedef float v4sf __attribute__ ((vector_size (16)));
@@ -43,9 +49,11 @@ typedef int v4si __attribute__ ((vector_size (16)));
 #define IZ(vec) __builtin_ia32_vec_ext_v4si ((vec), 2)
 #define IW(vec) __builtin_ia32_vec_ext_v4si ((vec), 3)
 
-void ALIGNED coords_to_ray(int dw, int dh, int x, int y, struct Ray *rayp) {
+float fov;
+
+void ALIGNED coordsf_to_ray(int dw, int dh, float x, float y, struct Ray *rayp) {
   float ratio = dw * 1.0f / dh;
-  v4sf v = (v4sf) {ratio * ((float) x / (dw / 2.0) - 1.0), 1.0 - (float) y / (dh / 2.0), 1.0, 0.0};
+  v4sf v = (v4sf) {ratio * fov * (x / (dw / 2.0) - 1.0), fov * (1.0 - y / (dh / 2.0)), 1.0, 0.0};
   v4sf res = v;
   v *= v;
   float f = 1.0f / sqrtf(*(float*) &v + *((float*) &v + 1) + *((float*) &v + 2));
@@ -55,25 +63,37 @@ void ALIGNED coords_to_ray(int dw, int dh, int x, int y, struct Ray *rayp) {
   *(v4sf*) &rayp->dir = (v4sf) res;
 }
 
-void ALIGNED ray_to_coords(int dw, int dh, struct Ray *rayp, int *xp, int *yp) {
-  float ratio = dw * 1.0f / dh;
-  v4sf dir = *(v4sf*) &rayp->dir;
-  dir /= (v4sf) FOUR(Z(dir)); // renormalize
-  int x = (int) (((1.0f + (X(dir) / ratio)) / 2.0f) * dw + 0.5);
-  int y = (int) (((1.0f - Y(dir)) / 2.0f) * dh + 0.5);
-  *xp = x;
-  *yp = y;
+void ALIGNED coords_to_ray(int dw, int dh, int x, int y, struct Ray *rayp) {
+  coordsf_to_ray(dw, dh, (float) x, (float) y, rayp);
 }
 
-void ALIGNED fastsetup(int xfrom, int xto, int yfrom, int yto, int dw, int dh, struct VMState *state) {
+void ALIGNED ray_to_coordsf(int dw, int dh, struct Ray *rayp, float *xp, float *yp) {
   float ratio = dw * 1.0f / dh;
-  for (int y = yfrom; y < yto; ++y) {
-    for (int x = xfrom; x < xto; ++x) {
-      state->resid = 0;
-      state->rayid = 1;
-      coords_to_ray(dw, dh, x, y, state->rays_ptr);
-      state ++;
-    }
+  v4sf dir = *(v4sf*) &rayp->dir;
+  dir /= (v4sf) FOUR(Z(dir)); // denormalize
+  *xp = (1.0f + (X(dir) / (ratio * fov))) * (dw / 2.0);
+  *yp = (1.0f - (Y(dir) / fov)) * (dh / 2.0);
+}
+
+void ALIGNED ray_to_coords(int dw, int dh, struct Ray *rayp, int *xp, int *yp) {
+  float x, y;
+  ray_to_coordsf(dw, dh, rayp, &x, &y);
+  *xp = (int) (x + 0.5);
+  *yp = (int) (y + 0.5);
+}
+
+void ALIGNED fastsetup(struct Ray **rayplanes, int from, int to, int dw, int dh, int stepsize, struct VMState *state) {
+  // float ratio = dw * 1.0f / dh;
+  struct Ray *rayplane = rayplanes[0];
+  int i = 0;
+  for (int k = from; k < to; ++k) {
+    if (++i != stepsize) continue;
+    i = 0;
+    state->resid = 0;
+    state->rayid = 1;
+    int x = k % dw, y = k / dw;
+    coords_to_ray(dw, dh, x, y, rayplane);
+    state ++; rayplane ++;
   }
 }
 
@@ -100,24 +120,30 @@ void ALIGNED fastsetup(int xfrom, int xto, int yfrom, int yto, int dw, int dh, s
 #define V4SF(v) (*(v4sf*) &(v))
 #define V4SI(v) (*(v4si*) &(v))
 
+#define LIKELY(X) (__builtin_expect((X), 1))
+#define UNLIKELY(X) (__builtin_expect((X), 0))
+
 // IMPORTANT: use -mstackrealign!
 void ALIGNED fast_sphere_process(
+  struct Ray **rayplanes, struct Result **resplanes,
   struct VMState *states, int numstates,
   vec3f center, float rsq,
   void* self
 ) {
+// #define PREFETCH_HARD(X, READ, LOCALITY) \
+//   __builtin_prefetch(X, READ, LOCALITY); \
+//   __asm__ volatile ("" : : : "memory"); // force break
 #define PREFETCH_HARD(X, READ, LOCALITY) \
-  __builtin_prefetch(X, READ, LOCALITY); \
-  __asm__ volatile ("" : : : "memory"); // force break
+  __builtin_prefetch(X, READ, LOCALITY); // volatile makes no difference
   for (int i = 0; i < numstates; ++i) {
     struct VMState* sp = states++;
     PREFETCH_HARD(sp, 1, 3);
     
     if (sp->stream_ptr[0] != self) continue;
-    struct Ray* RAY = sp->rays_ptr + sp->rayid - 1;
+    struct Ray* RAY = rayplanes[sp->rayid - 1] + i;
     
     sp->stream_ptr ++; sp->stream_len --;
-    struct Result *res = sp->res_ptr + sp->resid ++;
+    struct Result *res = resplanes[sp->resid ++] + i;
     PREFETCH_HARD(RAY, 0, 0);
     
     // pos = ray.pos - center; pretranslate so we can pretend we're a sphere around (0, 0, 0)
@@ -181,6 +207,7 @@ void ALIGNED fast_sphere_process(
 }
 
 void fast_scale_process(
+  struct Ray **rayplanes, struct Result **resplanes,
   struct VMState *states, int numstates,
   float factor,
   void* self
@@ -191,9 +218,9 @@ void fast_scale_process(
     if (sp->stream_ptr[0] != self) continue;
     sp->stream_ptr ++; sp->stream_len --;
     
-    struct Ray *RAY  = sp->rays_ptr + sp->rayid - 1;
+    struct Ray *RAY  = rayplanes[sp->rayid - 1] + i;
     sp->rayid ++;
-    struct Ray *RAY2 = sp->rays_ptr + sp->rayid - 1;
+    struct Ray *RAY2 = rayplanes[sp->rayid - 1] + i;
     
     V4SF(RAY2->pos) = V4SF(RAY->pos) * (v4sf) FOUR(1/factor);
     V4SF(RAY2->dir) = V4SF(RAY->dir);
@@ -202,6 +229,7 @@ void fast_scale_process(
 
 #include <limits.h>
 void ALIGNED fast_checker_process(
+  struct Ray **rayplanes, struct Result **resplanes,
   struct VMState *states, int numstates,
   vec3f a, vec3f b,
   void* self
@@ -212,30 +240,32 @@ void ALIGNED fast_checker_process(
     if (sp->stream_ptr[0] != self) continue;
     sp->stream_ptr ++; sp->stream_len --;
     
-    struct Result *res = sp->res_ptr + sp->resid - 1;
-    struct Ray *ray = sp->rays_ptr + sp->rayid - 1;
+    struct Result *res = resplanes[sp->resid - 1] + i;
+    struct Ray *ray = rayplanes[sp->rayid - 1] + i;
     if (res -> success) {
       v4sf hitpos = V4SF(ray->pos) + (v4sf) FOUR(res->distance) * V4SF(ray->dir);
       vec3f hitposv = *(vec3f*) &hitpos;
       res->emissive_col = (vec3f){0,0,0,0};
+      // would overflow
       if (fabsf(hitposv.x) > INT_MAX || fabsf(hitposv.y) > INT_MAX || fabsf(hitposv.z) > INT_MAX) {
-        res->col = a;
-      } else {
-        int ix = (int) hitposv.x, iy = (int) hitposv.y, iz = (int) hitposv.z;
-        if (hitposv.x < 0) ix --;
-        if (hitposv.y < 0) iy --;
-        if (hitposv.z < 0) iz --;
-        if ((ix & 1) ^ (iy & 1) ^ (iz & 1))
-          res->col = b;
-        else
-          res->col = a;
+        v4sf temp = (V4SF(b) + V4SF(a)) / (v4sf) FOUR(2);
+        res->col = *(vec3f*) &temp;
+        continue;
       }
+      int ix = (int) hitposv.x, iy = (int) hitposv.y, iz = (int) hitposv.z;
+      if (hitposv.x < 0) ix --;
+      if (hitposv.y < 0) iy --;
+      if (hitposv.z < 0) iz --;
+      if ((ix & 1) ^ (iy & 1) ^ (iz & 1))
+        res->col = b;
+      else
+        res->col = a;
     }
   }
 }
 
-
 void ALIGNED fast_plane_process(
+  struct Ray **rayplanes, struct Result **resplanes,
   struct VMState *states, int numstates,
   vec3f normal, vec3f base,
   void* self
@@ -246,10 +276,10 @@ void ALIGNED fast_plane_process(
     if (sp->stream_ptr[0] != self) continue;
     sp->stream_ptr ++; sp->stream_len --;
     
-    struct Ray *ray = sp->rays_ptr + sp->rayid - 1;
+    struct Ray *ray = rayplanes[sp->rayid - 1] + i;
     v4sf pos = V4SF(ray->pos), dir = V4SF(ray->dir);
     
-    struct Result *res = sp->res_ptr + ++ sp->resid - 1;
+    struct Result *res = resplanes[++sp->resid - 1] + i;
     v4sf part1 = V4SF(normal) * (pos - V4SF(base));
     v4sf part2 = dir * V4SF(normal);
     float sum2 = XSUM(part2);
@@ -267,37 +297,47 @@ void ALIGNED fast_plane_process(
 }
 
 void ALIGNED fast_group_process(
+  struct Ray **rayplanes, struct Result **resplanes,
   struct VMState *states, int numstates,
   int len,
   void* self
 ) {
+  if (UNLIKELY(!len)) {
+    for (int i = 0; i < numstates; ++i) {
+      struct VMState* sp = states+i;
+      
+      if (sp->stream_ptr[0] != self) continue;
+      sp->stream_ptr ++; sp->stream_len --;
+      
+      sp->resid ++;
+      resplanes[sp->resid-1][i].success = 0;
+    }
+    return;
+  }
   for (int i = 0; i < numstates; ++i) {
-    struct VMState* sp = states++;
+    struct VMState* sp = states+i;
     
     if (sp->stream_ptr[0] != self) continue;
     sp->stream_ptr ++; sp->stream_len --;
     
-    int match = -1;
-    int resid = sp->resid, delta = resid - len;
-    struct Result *res = sp->res_ptr + delta;
-    float lowestDistance;
-    for (int k = 0; k < len; ++k) {
-      struct Result *current = res + k;
-      if (current->success && (match == -1 || current->distance < lowestDistance)) {
-        lowestDistance = current->distance;
-        match = k;
+    PREFETCH_HARD(&resplanes[sp->resid-2][i].success, 0, 0);
+    PREFETCH_HARD(&resplanes[sp->resid-1][i+1].success, 0, 0);
+    if (!resplanes[sp->resid-1][i].success) { }
+    else if (!resplanes[sp->resid-2][i].success) {
+      resplanes[sp->resid-2][i] = resplanes[sp->resid-1][i];
+    } else {
+      if (resplanes[sp->resid-2][i].distance <= resplanes[sp->resid-1][i].distance) {
+      } else {
+        resplanes[sp->resid-2][i] = resplanes[sp->resid-1][i];
       }
     }
-    if (match != -1) {
-      sp->res_ptr[delta] = res[match];
-    } else {
-      sp->res_ptr[delta].success = 0;
-    }
-    sp->resid -= len - 1;
+    sp->resid --;
+    continue;
   }
 }
 
 void ALIGNED fast_translate_process(
+  struct Ray **rayplanes, struct Result **resplanes,
   struct VMState *states, int numstates,
   vec3f vector,
   void* self
@@ -308,15 +348,16 @@ void ALIGNED fast_translate_process(
     if (sp->stream_ptr[0] != self) continue;
     sp->stream_ptr ++; sp->stream_len --;
     
-    struct Ray *ray = sp->rays_ptr + sp->rayid - 1;
+    struct Ray *ray  = rayplanes[sp->rayid - 1] + i;
     sp->rayid ++;
-    struct Ray *ray2 = sp->rays_ptr + sp->rayid - 1;
+    struct Ray *ray2 = rayplanes[sp->rayid - 1] + i;
     V4SF(ray2->pos) = V4SF(ray->pos) - V4SF(vector);
     V4SF(ray2->dir) = V4SF(ray->dir);
   }
 }
 
 void ALIGNED fast_light_process(
+  struct Ray **rayplanes, struct Result **resplanes,
   struct VMState *states, int numstates,
   vec3f* lightpos,
   void* self
@@ -327,11 +368,11 @@ void ALIGNED fast_light_process(
     if (sp->stream_ptr[0] != self) continue;
     sp->stream_ptr ++; sp->stream_len --;
     
-    struct Result *res = sp->res_ptr + sp->resid - 1;
+    struct Result *res = resplanes[sp->resid - 1] + i;
     if (res->success) {
       v4sf nspos;
       {
-        struct Ray *ray = sp->rays_ptr + sp->rayid - 1;
+        struct Ray *ray = rayplanes[sp->rayid - 1] + i;
         nspos = V4SF(ray->pos) + V4SF(ray->dir) * (v4sf) FOUR(res->distance * 0.999);
       }
       sp->rayid ++;
@@ -340,7 +381,7 @@ void ALIGNED fast_light_process(
       float ldfac = 1 / sqrtf(XSUM(lsq));
       lightdir *= (v4sf) FOUR(ldfac);
       {
-        struct Ray *ray = sp->rays_ptr + sp->rayid - 1;
+        struct Ray *ray = rayplanes[sp->rayid - 1] + i;
         V4SF(ray->pos) = nspos;
         V4SF(ray->dir) = lightdir;
       }
@@ -364,54 +405,8 @@ typedef struct {
 typedef struct TriangleNode {
   AABB aabb;
   int children_length; struct TriangleNode **children_ptr;
-  int capacity, length; TriangleInfo *info;
+  int capacity, length; int *info;
 } TriangleNode;
-
-#define LIKELY(X) (__builtin_expect((X), 1))
-#define UNLIKELY(X) (__builtin_expect((X), 0))
-
-static int internal_rayHitsAABB1d(float a, float b, float pos, float dir, float *dist) {
-  if (dir < 0) { a = -a; b = -b; pos = -pos; dir = -dir; }
-  float a_ = fminf(a, b) - pos;
-  b = fmaxf(a, b) - pos;
-  a = a_;
-  if (b < 0) return 0;
-  
-  if (dist) *dist = a / dir;
-  return 1;
-}
-
-#define UINT(F) ({ float f = F; *(unsigned int*) &f; })
-#define FLOAT(I) ({ unsigned int i = I; *(float*) &i; })
-
-static int internal_rayHitsAABB2d(v4sf ab, v4sf ray, float *dist) {
-  if (UNLIKELY(Z(ray) == 0)) {
-    if (X(ray) < X(ab) || X(ray) > Z(ab)) return 0;
-    return internal_rayHitsAABB1d(Y(ab), W(ab), Y(ray), W(ray), dist);
-  }
-  if (UNLIKELY(W(ray) == 0)) {
-    if (Y(ray) < Y(ab) || Y(ray) > W(ab)) return 0;
-    return internal_rayHitsAABB1d(X(ab), Z(ab), X(ray), Z(ray), dist);
-  }
-  v4si mask = (v4si) FOUR(1<<31);
-  v4sf temp = (v4sf){Z(ray), W(ray), Z(ray), W(ray)};
-  v4si signs = mask & *(v4si*) &temp;
-  ab = (v4sf) (*(v4si*) &ab ^ signs);
-  ray = (v4sf) (*(v4si*) &ray ^ signs);
-  ab = (v4sf) {fminf(X(ab), Z(ab)), fminf(Y(ab), W(ab)), fmaxf(X(ab), Z(ab)), fmaxf(Y(ab), W(ab))} - (v4sf) {X(ray), Y(ray), X(ray), Y(ray)};
-  v4si absign = mask & *(v4si*)&ab;
-  if (IZ(absign) | IW(absign)) return 0;
-  
-  // multiply every component with dir.(x*y)
-  // vec3f distab = ab / {dir, dir};
-  v4sf mulfac = __builtin_ia32_shufps(ray, ray, 238) /* wzwz */;
-  v4sf distab = ab * mulfac;
-  
-  float entry = fmaxf(X(distab), Y(distab));
-  float exit = fminf(Z(distab), W(distab));
-  if (dist) { *dist = entry / (Z(ray) * W(ray)); }
-  return entry <= exit;
-}
 
 static int internal_rayHitsAABB(vec3f *abp, vec3f *p_ray, float *dist) {
 #define ap &abp[0]
@@ -420,28 +415,6 @@ static int internal_rayHitsAABB(vec3f *abp, vec3f *p_ray, float *dist) {
 #define p_dir &p_ray[1]
   #define SF(VAR) (*(v4sf*) VAR)
   float dirprod = X(SF(p_dir)) * Y(SF(p_dir)) * Z(SF(p_dir));
-  if (UNLIKELY(dirprod == 0)) {
-    if (UNLIKELY(X(SF(p_dir)) == 0)) {
-      if (X(SF(p_pos)) < X(SF(ap)) || X(SF(p_pos)) > X(SF(bp))) return 0;
-      v4sf ab = (v4sf) {Y(SF(ap)), Z(SF(ap)), Y(SF(bp)), Z(SF(bp))};
-      v4sf ray = (v4sf) {Y(SF(p_pos)), Z(SF(p_pos)), Y(SF(p_dir)), Z(SF(p_dir))};
-      return internal_rayHitsAABB2d(ab, ray, dist);
-    }
-    if (UNLIKELY(Y(SF(p_dir)) == 0)) {
-      if (Y(SF(p_pos)) < Y(SF(ap)) || Y(SF(p_pos)) > Y(SF(bp))) return 0;
-      v4sf ab = (v4sf) {X(SF(ap)), Z(SF(ap)), X(SF(bp)), Z(SF(bp))};
-      v4sf ray = (v4sf) {X(SF(p_pos)), Z(SF(p_pos)), X(SF(p_dir)), Z(SF(p_dir))};
-      return internal_rayHitsAABB2d(ab, ray, dist);
-    }
-    if (UNLIKELY(Z(SF(p_dir)) == 0)) {
-      if (Z(SF(p_pos)) < Z(SF(ap)) || Z(SF(p_pos)) > Z(SF(bp))) return 0;
-      v4sf ab = (v4sf) {X(SF(ap)), Y(SF(ap)), X(SF(bp)), Y(SF(bp))};
-      v4sf ray = (v4sf) {X(SF(p_pos)), Y(SF(p_pos)), X(SF(p_dir)), Y(SF(p_dir))};
-      return internal_rayHitsAABB2d(ab, ray, dist);
-    }
-    __asm__("int $3");
-    return 0; // should never happen, only here for gcc flow control
-  }
   #undef SF
   v4si mask = (v4si) FOUR(1<<31);
   v4si signs = mask & *(v4si*)p_dir;
@@ -460,13 +433,34 @@ static int internal_rayHitsAABB(vec3f *abp, vec3f *p_ray, float *dist) {
   a = __builtin_ia32_minps(a, b_) - pos;
   // multiply every component with dir.(x*y*z)
   // vec3f dista = a / dir, distb = b / dir;
-  v4sf mulfac = __builtin_ia32_shufps(dir, dir, 1) /* yxx */ * __builtin_ia32_shufps(dir, dir, 26) /* zzy */;
-  v4sf dista = a * mulfac, distb = b * mulfac;
+  vec3f *_vdir = (vec3f*) &dir;
+  vec3f *_dista = (vec3f*) &a, *_distb = (vec3f*) &b;
+#define vdir (*_vdir)
+#define dista (*_dista)
+#define distb (*_distb)
   
-  float entry = fmaxf(X(dista), fmaxf(Y(dista), Z(dista)));
-  float exit = fminf(X(distb), fminf(Y(distb), Z(distb)));
-  if (dist) { *dist = entry / fabsf(dirprod); }
+  if (LIKELY(vdir.x != 0 && vdir.y != 0 && vdir.z != 0)) {
+    // vdir += (v4sf) {0, 0, 0, 1};
+    *(v4si*) &dir &= (v4si) {-1, -1, -1, 0};
+    dir += (v4sf) {0, 0, 0, 1};
+    a /= dir;
+    b /= dir;
+  } else {
+    if (LIKELY(vdir.x != 0)) { dista.x /= vdir.x; distb.x /= vdir.x; }
+    else { dista.x = copysignf(INFINITY, dista.x); distb.x = copysignf(INFINITY, distb.x); }
+    
+    if (LIKELY(vdir.y != 0)) { dista.y /= vdir.y; distb.y /= vdir.y; }
+    else { dista.y = copysignf(INFINITY, dista.y); distb.y = copysignf(INFINITY, distb.y); }
+    
+    if (LIKELY(vdir.z != 0)) { dista.z /= vdir.z; distb.z /= vdir.z; }
+    else { dista.z = copysignf(INFINITY, dista.z); distb.z = copysignf(INFINITY, distb.z); }
+  }
+  float entry = fmaxf(dista.x, fmaxf(dista.y, dista.z));
+  float exit = fminf(distb.x, fminf(distb.y, distb.z));
+  if (dist) { *dist = entry; }
   return entry <= exit;
+#undef dista
+#undef vdir
 #undef ap
 #undef bp
 #undef p_pos
@@ -492,9 +486,7 @@ typedef struct {
 
 #define ROUND16(X) ((void*) ((unsigned int)((char*) (X) + 15) & ~15))
 
-#define EPS 0.1
-
-static void __attribute__ ((hot)) internal_triangle_recurse(TriangleNode *node, RecursionInfo *info) {
+static void __attribute__ ((hot)) internal_triangle_recurse(TriangleNode *node, TriangleInfo *tlist, RecursionInfo *info, int *cache, int hash) {
   // __builtin_prefetch(&((TriangleInfo*) ROUND16(node + 1))->a);
   // printf("early prefetch %p\n", &((TriangleInfo*) ROUND16(node+1))->a);
   if (node->children_length) {
@@ -502,38 +494,35 @@ static void __attribute__ ((hot)) internal_triangle_recurse(TriangleNode *node, 
       float fs;
       for (int i = 0; i < node->children_length; ++i) {
         if (rayHits(&node->children_ptr[i]->aabb, &info->pos, &fs) && fs < info->closest)
-          internal_triangle_recurse(node->children_ptr[i], info);
+          internal_triangle_recurse(node->children_ptr[i], tlist, info, cache, hash);
       }
     } else {
       for (int i = 0; i < node->children_length; ++i) {
-        if (rayHits(&node->children_ptr[i]->aabb, &info->pos, 0)) internal_triangle_recurse(node->children_ptr[i], info);
+        if (rayHits(&node->children_ptr[i]->aabb, &info->pos, 0)) internal_triangle_recurse(node->children_ptr[i], tlist, info, cache, hash);
       }
     }
   } else {
-    // printf("late prefetch %p\n", (void*) &node->info[0]);
-    // already prefetched up top
-    // __builtin_prefetch(&node->info[0]);
     RecursionInfo rin = *info;
     for (int i = 0; i < node->length; ++i) {
-      // __builtin_prefetch(&node->info[i+1]);
-      TriangleInfo *ti = &node->info[i];
-      // printf("now access %p\n", (void*) &ti->a);
-      // __asm__("int $3");
+      int id = node->info[i];
+      // printf("%i: hash %i, compare %i: outcome %i\n", id, hash, cache[id].hash, cache[id].outcome);
+      if (cache[id] == hash) continue; // already considered
+      cache[id] = hash;
+      TriangleInfo *ti = &tlist[id];
       v4sf v_1 = V4SF(ti->n) * (V4SF(rin.pos) - V4SF(ti->a));
       v4sf v_2 = V4SF(rin.dir) * V4SF(ti->n);
       // float dist = - XSUM(v_1) / XSUM(v_2);
       // if (dist < 0) continue;
       float f_1 = XSUM(v_1), f_2 = XSUM(v_2);
       if (f_2 == 0) continue;
-      float dist = - f_1 / f_2;
-      // if (
-      //   f_2 >= 0 /* otherwise, backside hit */ ||
-      //   f_1 < 0) continue;
+      
       // float dist = - f_1 / f_2;
-      // don't need to retest this since rin->closest starts out FLT_MAX
-      // if (LIKELY(-rin.closest * f_2 < f_1)) continue;
-      if (dist < 0 || dist > rin.closest) continue;
-      // if (dist < 0.1) continue;
+      // if (dist < 0 || dist > rin.closest) continue;
+      if (- f_1 * f_2 < 0) continue;
+      float dist = - f_1 / f_2;
+      
+      if (UNLIKELY(dist > rin.closest)) continue;
+      
       v4sf p = V4SF(rin.pos) + (v4sf) FOUR(dist) * V4SF(rin.dir);
       v4sf v0 = V4SF(ti->c) - V4SF(ti->a);
       v4sf v1 = V4SF(ti->b) - V4SF(ti->a);
@@ -551,8 +540,7 @@ static void __attribute__ ((hot)) internal_triangle_recurse(TriangleNode *node, 
       // float v = X(__builtin_ia32_hsubps((v4sf) { dot00, dot01 } * (v4sf) { dot12, dot02 }, bogus)) * invDenom;
       // float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
       // float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
-      int test = (u > 0) & (v > 0) & (u+v < 1);
-      if (UNLIKELY(test)) {
+      if (UNLIKELY((u > 0) && (v > 0) && (u+v < 1))) {
         rin.closest_res = ti;
         rin.closest = dist;
         rin.uv = (vec2f) {u, v};
@@ -562,13 +550,109 @@ static void __attribute__ ((hot)) internal_triangle_recurse(TriangleNode *node, 
   }
 }
 
-void ALIGNED fast_triangle_recurse(TriangleNode *node, vec3f *pos, vec3f *dir, TriangleInfo** closest_res, float *closest, vec2f *uv) {
-  RecursionInfo ri;
-  ri.pos = *pos; ri.dir = *dir;
+static void fast_triangle_recurse_intern(TriangleNode *node, vec3f *pos, vec3f *dir, TriangleInfo *tlist, TriangleInfo **closest_res, float *closest, vec2f *uv,
+                                         int *cache, int hash) {
+  __attribute__ ((aligned (16))) RecursionInfo ri;
+  *(v4sf*) &ri.pos = *(v4sf*) pos;
+  *(v4sf*) &ri.dir = *(v4sf*) dir;
   ri.closest_res = 0;
   ri.closest = INFINITY;
-  internal_triangle_recurse(node, &ri);
+  internal_triangle_recurse(node, tlist, &ri, cache, hash);
   *closest_res = ri.closest_res;
   *closest = ri.closest;
   *uv = ri.uv;
+}
+
+struct HdrTex {
+  int w, h;
+  int data_len; v4sf* data_ptr;
+};
+
+struct Texture {
+  gdImagePtr gdp;
+  struct HdrTex *hdp;
+};
+
+static v4sf lookupTex(int x, int y, struct Texture* texptr) {
+  if (texptr->gdp) {
+    int res = texptr->gdp->tpixels[((unsigned int) y)%texptr->gdp->sy][((unsigned int) x)%texptr->gdp->sx];
+    return (v4sf){(res>>16)&0xff, (res>>8)&0xff, (res>>0)&0xff, 0} / (v4sf){256,256,256,256};
+  } else {
+    int index = y * texptr->hdp->w + x;
+    if (index < 0 || index >= texptr->hdp->data_len) return (v4sf) FOUR(0);
+    return texptr->hdp->data_ptr[index];
+  }
+}
+
+void ALIGNED interpolate(float u, float v, struct Texture* texptr, vec3f *res) {
+  int w, h;
+  if (texptr->gdp) {
+    w = texptr->gdp->sx;
+    h = texptr->gdp->sy;
+  } else {
+    w = texptr->hdp->w;
+    h = texptr->hdp->h;
+  }
+  float coordx = u * w, coordy = v * h;
+  int ix = (int) floorf(coordx), iy = (int) floorf(coordy);
+  float facx = coordx - ix, facy = coordy - iy, ifacx = 1 - facx, ifacy = 1 - facy;
+#define MKV4SF(X) ({ float f = (X); (v4sf) {f,f,f,f}; })
+#define V4RES (*(v4sf*) res)
+  V4RES =
+      lookupTex(ix, iy, texptr)     * MKV4SF(ifacx * ifacy)
+    + lookupTex(ix, iy+1, texptr)   * MKV4SF(ifacx *  facy)
+    + lookupTex(ix+1, iy, texptr)   * MKV4SF( facx * ifacy)
+    + lookupTex(ix+1, iy+1, texptr) * MKV4SF( facx *  facy)
+  ;
+  // blatantly cheat the envmap detection
+  V4RES = (v4sf)FOUR(1.0f/255) + V4RES * (v4sf)FOUR(254.0f/255);
+#undef MKV4SF
+}
+
+void ALIGNED fast_triangleset_process(
+  struct Ray **rayplanes, struct Result **resplanes,
+  struct VMState *states, int numstates,
+  TriangleInfo *tlist, TriangleNode *root,
+  int *cache, int *hashp,
+  void* self
+) {
+  for (int i = 0; i < numstates; ++i) {
+    struct VMState* sp = states + i;
+    
+    if (sp->stream_ptr[0] != self) continue;
+    sp->stream_ptr ++; sp->stream_len --;
+    
+    sp->resid ++;
+    struct Result *res = resplanes[sp->resid-1] + i;
+    
+    vec3f *pos = &rayplanes[sp->rayid-1][i].pos;
+    vec3f *dir = &rayplanes[sp->rayid-1][i].dir;
+    
+    PREFETCH_HARD(pos, 0, 3);
+    PREFETCH_HARD(res, 1, 3);
+    
+    float closest; TriangleInfo *closest_info = 0;
+    vec2f texcoord;
+    (*hashp) ++;
+    fast_triangle_recurse_intern(root, pos, dir, tlist, &closest_info, &closest, &texcoord, cache, *hashp);
+    
+    res->success = 0;
+    if (closest_info) {
+      vec2f texcoord2;
+      texcoord2.x = closest_info->uv_a.x + texcoord.x * closest_info->uv_ca.x + texcoord.y * closest_info->uv_ba.x;
+      texcoord2.y = closest_info->uv_a.y + texcoord.x * closest_info->uv_ca.y + texcoord.y * closest_info->uv_ba.y;
+      res->texcoord = texcoord2;
+      res->success = 1;
+      res->distance = closest;
+      res->emissive_col = (vec3f) {0,0,0,0};
+      res->normal = closest_info->n;
+      void* texst = closest_info->texstate;
+      res->texinfo = texst;
+      if (texst) {
+        interpolate(texcoord2.x, 1-texcoord2.y, texst, &res->col);
+      } else {
+        res->col = (vec3f) {1,1,1,1};
+      }
+    }
+  }
 }

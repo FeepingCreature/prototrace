@@ -1,0 +1,110 @@
+module copytest;
+
+import gd, sdl, std.file, std.random, std.math, sdl_ttf;
+
+IRandom rng;
+int rand() { if !rng rng = getPRNG 23; return rng.rand(); }
+float randf() { return rand() & 0x7fff_ffff # * 1f / 0x7fff_ffff; }
+
+vec3f rand_sphere() {
+  while true {
+    auto vec = vec3f((randf() * 2 - 1) x 3);
+    if |vec| <= 1 return vec;
+  }
+}
+
+vec3f vary(vec3f v, float play) {
+  while true {
+    auto v2 = v + rand_sphere() * play;
+    // if v2.(0 <= x <= 1 && 0 <= y <= 1 && 0 <= z <= 1) return v2;
+    return v2;
+  }
+}
+
+void main() {
+  auto lenna = gdImageCreateFromPngPtr(readAll("Lenna.png").(length, ptr));
+  auto fc = new TTF_FontClass (void[]: import("Vera.ttf")[], 15);
+  vec3f readColor(int x, y) {
+    int res = lenna.tpixels[y%lenna.sy][x%lenna.sx];
+    return vec3f(res >> 16 #&0xff #*1f/0xff, res >> 8 #&0xff #*1f/0xff, res #&0xff #*1f/0xff);
+  }
+  screen(1024, 1024);
+  for int (y, x) <- cross(0..512, 0..512) {
+    display.pset(x, y, readColor(x, y));
+  }
+  // void stepRandom;
+  vec3f sampleColor(int x, y) {
+    auto truecol = readColor(x, y);
+    return vary(truecol, 0.5);
+  }
+  auto res = new vec4f[] $ 512 * 512;
+  for auto p <- refs res {
+    *p = vec4f(0);
+  }
+  void sampleMonteCarlo() {
+    int (x, y) = (rand() % 512) x 2;
+    auto sample = sampleColor(x, y);
+    res[y*512+x] += sample.(vec4f(x, y, z, 1));
+  }
+  int metro_x, metro_y;
+  vec3f metro_color;
+  float value(vec3f v) { return v.x * 0.2 + v.y * 0.3 + v.z * 0.5; /* r, g, b */ }
+  void sampleMetropolis() {
+    int prop_x, prop_y;
+    if (randf() > 0.9) (prop_x, prop_y) = (rand() % 512) x 2;
+    else (prop_x, prop_y) = (metro_x + rand() % 11 - 5, metro_y + rand() % 11 - 5);
+    prop_x &= 511;
+    prop_y &= 511;
+    
+    auto sample = sampleColor (prop_x, prop_y);
+    float val1 = value metro_color, val2 = value sample;
+    float factor = val2 / val1;
+    
+    void switchTo() {
+      (metro_x, metro_y) = (prop_x, prop_y);
+      metro_color = sample;
+    }
+    if (factor > 1) switchTo;
+    else if (randf() < factor) switchTo;
+    
+    auto metro_val = value metro_color, metro_col = metro_color / metro_val;
+    res[metro_y*512+metro_x] += metro_col.(vec4f(x, y, z, 1 / metro_val));
+  }
+  vec2i base = vec2i(512, 0);
+  for int k <- 1..10001 {
+    for 0..512*512 {
+      // sampleMonteCarlo;
+      sampleMetropolis;
+    }
+    for int (y, x) <- cross(0..512, 0..512) {
+      auto val = res[y*512+x];
+      vec3f col;
+      if (val.w == 0f) col = vec3f(0);
+      else col = val.(xyz/w);
+      for int i <- 0..3 {
+        alias v = col[i];
+        if v < 0 v = 0;
+        if v > 1 v = 1;
+      }
+      display.pset(base + vec2i(x, y), col);
+    }
+    auto bg = mkSDLColor vec3f(1);
+    fontsettings fs = deflt;
+    fs.color = vec3f(0);
+    fc.render (rendermode => 1, bg => &bg, s => fs, "$k samples per pixel").blit display.at $ base + 16;
+    if (k == 1) base = vec2i(0, 512);
+    if (k == 5) base = vec2i(512, 512);
+    flip;
+  }
+  {
+    auto gdp = gdImageCreateTrueColor(display.(w, h));
+    onSuccess gdImageDestroy gdp;
+    for int (y, x) <- cross(0..display.h, 0..display.w) {
+      gdp.tpixels[y][x] = display.getp(x, y);
+    }
+    auto hdl = fopen ("copytest.png", "w");
+    gdImagePng(gdp, c.gd.FILE*: hdl);
+    fclose hdl;
+  }
+  while true flip;
+}

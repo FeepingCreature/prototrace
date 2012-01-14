@@ -2,11 +2,18 @@ module scene.envmap;
 
 import scene.base, scene.texture;
 
+float bound(float low, float high, float f) {
+  high -= low; f -= low;
+  if (f >= high) f -= high * int:(f / high);
+  if (f < 0)     f += high * int:(f / high + 1);
+  return f + low;
+}
+
 class EnvMap : SceneObject {
   void* tex;
   float radius; // NOT infinity!
   void init(void* tex, float rad) { this.tex = tex; radius = rad; }
-  bool collide(Ray* ray, Result* res) { raise-error new Error "EnvMap::collide not implemented! "; }
+  bool collide(Ray* ray, Result* res) { raise new Error "EnvMap::collide not implemented! "; }
   void process(VMState[] list) {
     for int i <- 0..list.length {
       auto sp = &list[i];
@@ -15,23 +22,30 @@ class EnvMap : SceneObject {
       sp.stream = sp.stream[1..$];
       
       using sp mixin(allocResult);
-      auto res = sp.result;
-      auto dir = sp.ray.dir;
+      auto res = &resplanes[sp.result-id-1][i];
+      auto ray = &rayplanes[sp.ray-id-1][i];
+      auto dir = ray.dir;
       
-      float angle1 = atan2(dir.z, dir.x);
+      float angle1 = atan2(dir.x, dir.z);
       float angle2 = atan2(-dir.y, sqrt(dir.(x*x+z*z)));
       
       angle1 = (angle1 + PI) / (PI * 2);
       angle2 = (angle2 + PI/2) / PI;
+      angle1 = bound(0, 1, angle1 - 0.1);
+      
+      auto p_2 = ray.(pos * dir).sum;
+      auto q = ray.(pos * pos).sum - radius*radius;
+      
+      auto dist = - p_2 + sqrt(p_2*p_2 - q);
       
       res.success = true;
-      res.distance = sp.ray.(radius - |pos| * (pos*dir).sum); // work THIS one out, future me!
-      res.emissive-color = interpolate(angle1, angle2, tex);
+      res.distance = dist;
+      interpolate(angle1, angle2, tex, &res.emissive-color);
       res.reflective-color = vec3f(0);
     }
   }
   CommandHandler[] buildCommandStream(VMStats* stats) {
-    stats.results-needed-cur ++;
+    stats.needsResult;
     return CommandHandler[]:null ~ this;
   }
 }

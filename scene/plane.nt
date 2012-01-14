@@ -2,7 +2,7 @@ module scene.plane;
 
 import scene.base;
 
-extern(C) void fast_plane_process(VMState*, int numstates, vec3f normal, base, void* self);
+extern(C) void fast_plane_process(Ray**, Result**, VMState*, int numstates, vec3f normal, base, void* self);
 
 class Plane : SceneObject {
   vec3f normal, base;
@@ -16,7 +16,7 @@ class Plane : SceneObject {
     return true;
   }
   void process(VMState[] list) {
-    fast_plane_process(list.ptr, list.length, normal, base, void*:CommandHandler:this);
+    fast_plane_process(rayplanes.ptr, resplanes.ptr, list.ptr, list.length, normal, base, void*:CommandHandler:this);
     return;
     for (int i = 0; i < list.length; ++i) {
       auto sp = &list[i];
@@ -24,9 +24,10 @@ class Plane : SceneObject {
       if (void*:sp.handler == void*:CommandHandler:this)::
       sp.stream = sp.stream[1..$];
       
-      auto pos = sp.ray.pos, dir = sp.ray.dir;
+      auto ray = &rayplanes[sp.ray-id-1][i];
+      auto pos = ray.pos, dir = ray.dir;
       using sp mixin(allocResult);
-      auto res = sp.result;
+      auto res = &resplanes[sp.result-id-1][i];
       float dist = -(normal * (pos - base)).sum / (dir * normal).sum;
       if (dist < 0) res.success = false;
       else {
@@ -36,7 +37,7 @@ class Plane : SceneObject {
     }
   }
   CommandHandler[] buildCommandStream(VMStats* stats) {
-    stats.results-needed-cur ++;
+    stats.needsResult;
     return CommandHandler[]:null ~ this;
   }
 }

@@ -39,14 +39,4 @@ struct Result {
   }
 }
 
-vec3f evaluateRay(Ray[] steps, Result[] hits) {
-  vec3f res = vec3f(0);
-  assert(steps.length == hits.length);
-  for (int i = steps.length - 1; i >= 0; --i) {
-    if (!hits[i].success) res = vec3f(0);
-    else res = hits[i].(reflective-color * res + emissive-color);
-  }
-  return res;
-}
-
 interface CommandHandler;

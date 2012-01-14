@@ -1,0 +1,3 @@
+module test;
+import std.string;
+void main() { auto bar = "foo foo".split(" "); writeln "$(string-of \"foo foo\".split(\" \"))"; }

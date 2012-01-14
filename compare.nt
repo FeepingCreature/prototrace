@@ -1,0 +1,33 @@
+module compare;
+
+import std.random;
+
+IRandom rng;
+void init() { rng = getPRNG 23; }
+float randf() { return std.random.base.randf(rng); }
+
+vec3f genRandVecHalf() {
+  vec3f vec;
+  do {
+    vec = vec3f(randf() * 2 - 1, randf(), randf() * 2 - 1);
+  } while (|vec| >= 1) { }
+  return vec;
+}
+
+void main() {
+  float genVecCosDistributed() { return 1; }
+  float genVecCosWeighted() {
+    vec3f vec = genRandVecHalf().normalized;
+    auto dot = vec * vec3f.Y #.sum;
+    return dot;
+  }
+  float detAvg(float delegate() dg) {
+    float res = 0;
+    alias count = 10M;
+    auto sq = sqrtf(count);
+    for 0..count res += dg()/sq;
+    return res / sq;
+  }
+  writeln "cos distributed: $(detAvg &genVecCosDistributed)";
+  writeln "cos weighted: $(detAvg &genVecCosWeighted)";
+}

@@ -2,32 +2,80 @@ module vm;
 
 import base;
 
+Ray*[] rayplanes;
+Result*[] resplanes;
+
 struct VMState {
   int result-id, ray-id;
   
-  Ray* ray-stack;
-  alias ray = &ray-stack[ray-id - 1];
-  alias rays = ray-stack[0 .. ray-id];
-  
-  Result* result-stack;
-  alias result = &result-stack[result-id - 1];
-  alias results = result-stack[0 .. result-id];
-  
   CommandHandler[] stream;
   
-  int x, y;
+  int state;
+  float state2;
+  int burnInCounter;
+  
+  vec3f rayCache;
+  bool cached, cachedBack;
   
   alias handler = stream[0];
-  alias allocResult = `
-    result-id ++;
-  `;
+  alias allocResult = `{ result-id ++; resplanes[result-id-1][i].success = false; }`;
   alias freeResult = `
     result-id -= !!;
   `;
-  alias allocRay = `
-    ray-id ++;
-  `;
+  alias allocRay = `ray-id ++;`;
   alias freeRay = `
     ray-id -= !!;
   `;
+}
+
+extern(C) float acosf(float);
+import std.math;
+vec3f evaluateRay(VMState* sp, int i, int firstRay, firstRes, end = 0, bool* isBack = null) {
+  if (sp.cached) {
+    if (isBack) *isBack = sp.cachedBack;
+    return sp.rayCache;
+  }
+  // auto rays = sp.rays[firstRay .. $ - end], hits = sp.results[firstRes .. $ - end];
+  int numRays = (sp.ray-id - end) - firstRay, numHits = (sp.result-id - end) - firstRes;
+  vec3f res = vec3f(0);
+  if (numRays != numHits) {
+    writeln "Mismatched call for evaluateRay: $numRays and $numHits";
+    asm `int $3`;
+  }
+  int start = 0;
+  while (start < numHits && (resplanes[firstRes+start][i]).(success && reflective-color != vec3f(0))) {
+    start ++;
+  }
+  
+  if (!start) sp.cachedBack = true;
+  else sp.cachedBack = false;
+  if (isBack) *isBack = sp.cachedBack;
+  
+  if (start >= numHits) start = numHits - 1;
+  Ray* nextRay;
+  for (int k = start; k >= 0; --k) {
+    auto resp = &resplanes[firstRes+k][i];
+    float factor = 1;
+    // cosine weighting
+    if (nextRay && resp.reflective-color != vec3f(0) && res != vec3f(0)) {
+      auto n = resp.normal.normalized;
+      float p = n * nextRay.dir #.sum;
+      if (p < 0) {
+        n = -n; p = n * nextRay.dir #.sum;
+      }
+      // this will be almost perfectly 1. smudge it.
+      // if (p >= 1) p = 0.99999;
+      factor = p;
+      // factor = acosf p / (PI/2);
+      factor *= 2; // difference between cos weight and cos distribution
+    }
+    auto oldres = res;
+    res = factor * resp.reflective-color * res + resp.emissive-color;
+    // if (k != 0 || resp.reflective-color != vec3f(0))
+    //   writeln "$k: $(((*resp).reflective-color, (*resp).emissive-color)) on $oldres => $res";
+    nextRay = &rayplanes[firstRay+k][i];
+  }
+  sp.cached = true;
+  sp.rayCache = res;
+  return res;
 }

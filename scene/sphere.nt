@@ -2,7 +2,7 @@ module scene.sphere;
 
 import scene.base;
 
-extern(C) void fast_sphere_process(VMState*, int numstates, vec3f center, float rsq, void* self);
+extern(C) void fast_sphere_process(Ray** rayplanes, Result** resplanes, VMState*, int numstates, vec3f center, float rsq, void* self);
 
 class Sphere : SceneObject {
   vec3f center;
@@ -30,7 +30,7 @@ class Sphere : SceneObject {
     return true;
   }
   void process(VMState[] list) {
-    fast_sphere_process(list.ptr, list.length, center, rsq, void*:CommandHandler:this);
+    fast_sphere_process(rayplanes.ptr, resplanes.ptr, list.ptr, list.length, center, rsq, void*:CommandHandler:this);
     return;
     for int i <- 0 .. list.length {
       auto sp = &list[i];
@@ -39,11 +39,11 @@ class Sphere : SceneObject {
       sp.stream = sp.stream[1..$];
       
       using sp mixin(allocResult);
-      vec3f pos = sp.ray.pos;
+      vec3f pos = rayplanes[sp.ray-id-1][i].pos;
       pos -= center; // pretranslate so we can pretend that we're a sphere around the origin
-      vec3f dir = sp.ray.dir;
+      vec3f dir = rayplanes[sp.ray-id-1][i].dir;
       
-      auto res = sp.result;
+      auto res = &resplanes[sp.result-id-1][i];
       
       float rsq = rsq;
       // algorithm 1 - benchs as FASTER!!
@@ -74,12 +74,12 @@ class Sphere : SceneObject {
       
       distance = [k1, k2][k2 > 0];
       col = vec3f(1);
-      vec3f normal = sp.ray.(pos + dir * distance) - center;
+      vec3f normal = rayplanes[sp.ray-id-1][i].(pos + dir * distance) - center;
       that.normal = normal / vec3f(|normal|);
     }
   }
   CommandHandler[] buildCommandStream(VMStats* stats) {
-    stats.results-needed-cur ++;
+    stats.needsResult;
     return CommandHandler[]: null ~ this;
   }
 }

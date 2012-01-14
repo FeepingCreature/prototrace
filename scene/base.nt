@@ -11,10 +11,30 @@ interface CommandHandler {
 struct VMStats {
   int results-needed-max, results-needed-cur;
   int rays-needed-max, rays-needed-cur;
+  void needsResults(int num) { results-needed-cur += num; recordHighPoint; }
+  void needsRays(int num) { rays-needed-cur += num; recordHighPoint; }
+  void needsResult() needsResults 1;
+  void needsRay() needsRays 1;
+  void recordHighPoint() {
+    if (rays-needed-cur > rays-needed-max) rays-needed-max = rays-needed-cur;
+    if (results-needed-cur > results-needed-max) results-needed-max = results-needed-cur;
+  }
 }
 
 class SceneObject : CommandHandler {
   bool collide(Ray*, Result*) { assert(false, "mew"); }
   void process(VMState[] list) { assert(false, "$this::process not implemented! "); }
   CommandHandler[] buildCommandStream(VMStats*) { assert(false, "$this::buildCommandStream not implemented! "); }
+}
+
+extern(C) int posix_memalign(void**, size_t, size_t);
+extern(C) void* GC_memalign(size_t, size_t);
+extern(C) void* memset(void*, int, int);
+bool useBoehm;
+void* aligned_calloc(int i) {
+  void* res;
+  if (useBoehm) res = GC_memalign(size_t:16, size_t:i);
+  else posix_memalign(&res, size_t:16, size_t:i);
+  memset(res, 0, i);
+  return res;
 }

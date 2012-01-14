@@ -2,7 +2,7 @@ module scene.scale;
 
 import scene.base;
 
-extern(C) void fast_scale_process(VMState*, int numstates, float scale, void* self);
+extern(C) void fast_scale_process(Ray**, Result**, VMState*, int numstates, float scale, void* self);
 
 class PostScale : CommandHandler {
   vec3f factor;
@@ -15,8 +15,13 @@ class PostScale : CommandHandler {
       sp.stream = sp.stream[1..$];
       
       using sp mixin(freeRay.replace("!!", "1"));
-      if (sp.result.success) {
-        sp.result.distance /= |sp.ray.dir / factor|;
+      auto res = &resplanes[sp.result-id-1][i];
+      if (res.success) {
+        auto ray = &rayplanes[sp.ray-id-1][i];
+        float f2 = |ray.dir / factor|;
+        if (f2 != 0)
+          res.distance /= f2;
+        // else we're pretty much boned.
       }
     }
   }
@@ -31,14 +36,14 @@ class Scale : SceneObject {
     Ray ray2 = void;
     ray2.pos = ray.pos / factor;
     ray2.dir = ray.dir / factor;
-    auto rescale = ray2.dir.length; ray2.dir /= rescale;
+    auto rescale = |ray2.dir|; ray2.dir /= rescale;
     if (sup.collide(&ray2, res)) {
       res.distance *= rescale;
       return true;
     } else return false;
   }
   void process(VMState[] list) {
-    // fast_scale_process(list.ptr, list.length, factor, void*:CommandHandler:this);
+    // fast_scale_process(rayplanes.ptr, resplanes.ptr, list.ptr, list.length, factor, void*:CommandHandler:this);
     // return;
     factor.w = 1; // oops
     for int i <- 0 .. list.length {
@@ -47,9 +52,9 @@ class Scale : SceneObject {
       if (void*:sp.handler == void*:CommandHandler:this)::
       sp.stream = sp.stream[1..$];
       
-      auto ray = sp.ray;
+      auto ray = &rayplanes[sp.ray-id-1][i];
       using sp mixin(allocRay);
-      auto ray2 = sp.ray;
+      auto ray2 = &rayplanes[sp.ray-id-1][i];
       ray2.pos = ray.pos / factor;
       ray2.dir = ray.dir / factor;
       float dist = |ray2.dir|;
@@ -57,13 +62,9 @@ class Scale : SceneObject {
     }
   }
   CommandHandler[] buildCommandStream(VMStats* stats) {
-    stats.rays-needed-cur ++;
+    stats.needsRay;
     auto res = CommandHandler[]:null ~ this ~ sup.buildCommandStream(stats) ~ new PostScale factor;
-    using stats {
-      if (rays-needed-cur > rays-needed-max)
-        rays-needed-max = rays-needed-cur;
-      rays-needed-cur --;
-    }
+    stats.rays-needed-cur --;
     return res;
   }
 }

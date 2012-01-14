@@ -27,10 +27,10 @@ class BoxBound : SceneObject {
       if (void*:sp.handler == void*:CommandHandler:this)::
       sp.stream = sp.stream[1..$];
       
-      if (!aabb.rayHits(&sp.ray.pos)) {
+      if (!aabb.rayHits(&rayplanes[sp.ray-id-1][i].pos)) {
         sp.stream = sp.stream[skip..$];
         using sp mixin(allocResult);
-        sp.result.success = false;
+        resplanes[sp.result-id-1][i].success = false;
       }
     }
   }

@@ -14,7 +14,7 @@ class AverageStep : CommandHandler {
       if (void*:sp.handler == void*:CommandHandler:this)::
       sp.stream = sp.stream[1..$];
       
-      auto res1 = &sp.result-stack[dst], res2 = &sp.result-stack[src];
+      auto res1 = &resplanes[dst][i], res2 = &resplanes[src][i];
       vec3f sum = vec3f(0);
       if (res1.success) sum = res1.emissive-color;
       if (res2.success) sum += res2.emissive-color * factor;
@@ -33,7 +33,7 @@ class AllocEmptyResult : CommandHandler {
       sp.stream = sp.stream[1..$];
       
       using sp mixin(allocResult);
-      sp.result.success = false;
+      resplanes[sp.result-id-1][i].success = false;
     }
   }
 }
@@ -57,7 +57,7 @@ class AverageResults : SceneObject {
   void init(int count, SceneObject sup) this.(sup, count) = (sup, count);
   CommandHandler[] buildCommandStream(VMStats* stats) {
     int base-id = stats.results-needed-cur;
-    stats.results-needed-cur ++;
+    stats.needsResult;
     auto stream = sup.buildCommandStream(stats);
     stats.results-needed-cur --;
     
@@ -89,7 +89,11 @@ class FreeRay : CommandHandler {
 }
 
 class CopyRay : CommandHandler {
+  int from;
+  void init() { from = -1; }
+  void init(int f) from = f;
   void process(VMState[] list) {
+    // TODO: memcpy runs
     for int i <- 0 .. list.length {
       auto sp = &list[i];
       
@@ -97,7 +101,48 @@ class CopyRay : CommandHandler {
       sp.stream = sp.stream[1..$];
       
       using sp mixin(allocRay);
-      *sp.ray = sp.rays[$-2];
+      if (from == -1) {
+        rayplanes[sp.ray-id - 1][i] = rayplanes[sp.ray-id - 2][i];
+      } else {
+        rayplanes[sp.ray-id - 1][i] = rayplanes[from][i];
+      }
     }
   }
+}
+
+class SkipAhead : CommandHandler {
+  int skipdist; void init(int i) skipdist = i;
+  void process(VMState[] list) {
+    for int i <- 0 .. list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      sp.stream = sp.stream[skipdist .. $];
+    }
+  }
+}
+
+class IfState : CommandHandler {
+  int compare, skip; void init(int c, s) (compare, skip) = (c, s);
+  void process(VMState[] list) {
+    for int i <- 0 .. list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      if (sp.state != compare) sp.stream = sp.stream[skip .. $];
+    }
+  }
+}
+
+CommandHandler[] mkIfElse(int compare, CommandHandler[] case1, case2) {
+  CommandHandler[auto~] res;
+  case1 ~= new SkipAhead(case2.length);
+  res ~= new IfState(compare, case1.length);
+  res ~= case1;
+  res ~= case2;
+  return res[];
 }

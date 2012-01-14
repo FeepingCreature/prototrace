@@ -2,64 +2,25 @@ module scene.group;
 
 import scene.base;
 
-extern(C) void fast_group_process(VMState*, int numstates, int len, void* self);
+extern(C) void fast_group_process(Ray**, Result**, VMState*, int numstates, int len, void* self);
 
 class Group : SceneObject {
   SceneObject[] list;
-  bool collide(Ray* ray, Result* res) {
-    Result current = void;
-    float lowestDistance = -1;
-    bool foundMatch;
-    for auto obj <- list {
-      if (obj.collide(ray, &current)) {
-        if (lowestDistance < 0 || current.distance < lowestDistance) {
-          lowestDistance = current.distance;
-          *res = current;
-          foundMatch = true;
-        }
-      }
-    }
-    return foundMatch;
-  }
+  string toString() { return "Group<$(list.length)>"; }
+  bool collide(Ray* ray, Result* res) { assert(false); }
   void process(VMState[] list) {
     auto len = this.list.length;
-    fast_group_process(list.ptr, list.length, len, void*:CommandHandler:this);
+    fast_group_process(rayplanes.ptr, resplanes.ptr, list.ptr, list.length, len, void*:CommandHandler:this);
     return;
-    for int i <- 0..list.length {
-      auto sp = &list[i];
-      
-      if (void*:sp.handler == void*:CommandHandler:this)::
-      sp.stream = sp.stream[1..$];
-      
-      int match = -1;
-      auto resid = sp.result-id, delta = resid - len;
-      auto res = sp.result-stack[delta .. resid];
-      float lowestDistance;
-      for int k <- 0 .. res.length {
-        auto current = &res[k];
-        if (current.success && (match == -1 || current.distance < lowestDistance)) {
-          lowestDistance = current.distance;
-          match = k;
-        }
-      }
-      if (match != -1) {
-        sp.result-stack[delta] = res[match];
-      } else {
-        sp.result-stack[delta].success = false;
-      }
-      using sp mixin(freeResult.replace("!!", "len - 1"));
-    }
   }
   CommandHandler[] buildCommandStream(VMStats* stats) {
     CommandHandler[auto~] res;
-    for auto obj <- list {
+    res ~= list[0].buildCommandStream(stats);
+    for auto obj <- list[1..$] {
       res ~= obj.buildCommandStream(stats);
+      res ~= this;
+      stats.results-needed-cur --;
     }
-    using stats {
-      if (results-needed-cur > results-needed-max) results-needed-max = results-needed-cur;
-      results-needed-cur -= list.length - 1;
-    }
-    res ~= this;
     return res[];
   }
 }

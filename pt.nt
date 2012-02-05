@@ -727,7 +727,7 @@ void main(string[] args) {
     addLong("noLensmut", "x", \ allowLensmut = false; );
     addLong("stepsize", "z", \(string s) stepsize = atoi s; );
     addLong("saveframes", "v", \ saveFrames = true; );
-    addLong("stepsize", "e", \(string s) savestep = atof s; );
+    addLong("savestep", "e", \(string s) savestep = atof s; );
     addLong("average", "a", \() average = true; );
     addLong("help", "h", \{ printHelp; exit 0; });
     args = process args;
@@ -755,8 +755,9 @@ void main(string[] args) {
   float lowest = 0;
   using new Group {
     auto bb = new BoxBound that;
-    // alias objfile = "hikone.obj";
-    alias objfile = "room box and sphere.obj";
+    alias objfile = "hikone.obj";
+    // alias objfile = "room box and sphere.obj";
+    // alias objfile = "teapot.obj";
     auto obj = string: import(objfile) #.split "\n";
     alias mtlfile = objfile.replace(".obj", ".mtl");
     auto mtl = string: import(mtlfile) #.split "\n";
@@ -857,11 +858,14 @@ void main(string[] args) {
   
   using new Group {
     list ~= new Scale(1/4.0, new CheckerPattern(vec3f(1, 0.9, 0.6), vec3f(0.6, 0.9, 1), new Plane(vec3f(0, 1, 0), vec3f(0, 0, 0))));
-    list ~= new EnvMap (readImage "OpenfootageNET_Beach_CavalinoItalylow.hdr", 1_000_000);
-    // list ~= new Shine(vec3f(1), new Plane(vec3f(0, -1, 0), vec3f(0, 100, 0)));
+    
+    list ~= new Scale(vec3f(-1, 1, -1), new EnvMap (readImage "OpenfootageNET_Beach_CavalinoItalylow.hdr", 1_000_000));
+    // list ~= new Shine(vec3f(0.5), new Plane(vec3f(0, -1, 0), vec3f(0, 100, 0)));
+    
     list ~= new CheckerPattern(vec3f(1, 0.9, 0.6), vec3f(0.6, 0.9, 1), new Plane(vec3f(0, 1, 0), vec3f(0, 0, 0)));
-    // list ~= new Translate(vec3f(1, -lowest / 25, 5), new Scale(vec3f(-1/25.0, 1/25.0, -1/25.0), object));
-    list ~= new Translate(vec3f(1, -lowest * 2, 1), new Scale(vec3f(2.5), object));
+    list ~= new Translate(vec3f(1, -lowest / 25, 5), new Scale(vec3f(-1/25.0, 1/25.0, -1/25.0), object));
+    // list ~= new Translate(vec3f(1, -lowest * 2, 1), new Scale(vec3f(2.5), object));
+    // list ~= new Scale(vec3f(0.05), new Translate(vec3f(50, -lowest, 120), object));
     scene = that;
   }
   

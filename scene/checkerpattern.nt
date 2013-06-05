@@ -2,8 +2,6 @@ module scene.checkerpattern;
 
 import scene.base;
 
-extern(C) void fast_checker_process(Ray**, Result**, VMState*, int numstates, vec3f a, b, void* self);
-
 class CheckerPattern : SceneObject {
   SceneObject sup;
   vec3f a, b;
@@ -17,8 +15,6 @@ class CheckerPattern : SceneObject {
     return true;
   }
   void process(VMState[] list) {
-    fast_checker_process(rayplanes.ptr, resplanes.ptr, list.ptr, list.length, a, b, void*:CommandHandler:this);
-    return;
     for int i <- 0..list.length {
       auto sp = &list[i];
       

@@ -1,14 +1,56 @@
 module scene.util;
 
+import std.random, std.thread;
+
 import scene.base;
+
+alias EPS = 0.999;
+
+shared int c__, c__2, c__3;
+
+shared int dw, dh;
+
+shared vec2f delegate() getScale;
+
+IRandom rng;
+float randf() { return std.random.base.randf(rng); }
+int rand() { return rng.rand(); }
+void init() {
+  rng = getPRNG(23);
+  auto dg = onThreadCreation;
+  onThreadCreation = new delegate void(void* basep) {
+    if (dg) { dg(basep); }
+    rng = getPRNG(int:basep);
+  };
+}
+
+vec3f rand_sphere() {
+  vec3f res;
+  float magn;
+  do {
+    res = vec3f((randf() * 2 - 1) x 3);
+    magn = |res|;
+  } while magn > 1 { }
+  return res / magn;
+}
+
+(float, float) vary(float x, y, int spread) {
+  float randf2() {
+    alias shift = -2;
+    float f = (randf() - 0.5) * 2 * spread;
+    if (f < 0) return -pow(2, -f + shift);
+    else       return  pow(2, f + shift);
+  }
+  return (x+randf2(), y+randf2());
+}
 
 class AverageStep : CommandHandler {
   int count;
   int dst, src; // average src into dst
-  void init(int c, dst, src) { (count, this.dst, this.src) = (c, dst, src); }
-  void process(VMState[] list) {
+  void init(int c, dst, src) { this.(count, dst, src) = (c, dst, src); }
+  void process(VMState[] list, int start, end) {
     float factor = 1f / count;
-    for int i <- 0 .. list.length {
+    for int i <- start .. end {
       auto sp = &list[i];
       
       if (void*:sp.handler == void*:CommandHandler:this)::
@@ -25,8 +67,8 @@ class AverageStep : CommandHandler {
 }
 
 class AllocEmptyResult : CommandHandler {
-  void process(VMState[] list) {
-    for int i <- 0 .. list.length {
+  void process(VMState[] list, int start, end) {
+    for int i <- start .. end {
       auto sp = &list[i];
       
       if (void*:sp.handler == void*:CommandHandler:this)::
@@ -39,8 +81,8 @@ class AllocEmptyResult : CommandHandler {
 }
 
 class FreeResult : CommandHandler {
-  void process(VMState[] list) {
-    for int i <- 0 .. list.length {
+  void process(VMState[] list, int start, end) {
+    for int i <- start .. end {
       auto sp = &list[i];
       
       if (void*:sp.handler == void*:CommandHandler:this)::
@@ -76,8 +118,8 @@ class AverageResults : SceneObject {
 }
 
 class FreeRay : CommandHandler {
-  void process(VMState[] list) {
-    for int i <- 0 .. list.length {
+  void process(VMState[] list, int start, end) {
+    for int i <- start .. end {
       auto sp = &list[i];
       
       if (void*:sp.handler == void*:CommandHandler:this)::
@@ -92,9 +134,9 @@ class CopyRay : CommandHandler {
   int from;
   void init() { from = -1; }
   void init(int f) from = f;
-  void process(VMState[] list) {
+  void process(VMState[] list, int start, end) {
     // TODO: memcpy runs
-    for int i <- 0 .. list.length {
+    for int i <- start .. end {
       auto sp = &list[i];
       
       if (void*:sp.handler == void*:CommandHandler:this)::
@@ -112,8 +154,8 @@ class CopyRay : CommandHandler {
 
 class SkipAhead : CommandHandler {
   int skipdist; void init(int i) skipdist = i;
-  void process(VMState[] list) {
-    for int i <- 0 .. list.length {
+  void process(VMState[] list, int start, end) {
+    for int i <- start .. end {
       auto sp = &list[i];
       
       if (void*:sp.handler == void*:CommandHandler:this)::
@@ -124,6 +166,7 @@ class SkipAhead : CommandHandler {
   }
 }
 
+/*
 class IfState : CommandHandler {
   int compare, skip; void init(int c, s) (compare, skip) = (c, s);
   void process(VMState[] list) {
@@ -145,4 +188,67 @@ CommandHandler[] mkIfElse(int compare, CommandHandler[] case1, case2) {
   res ~= case1;
   res ~= case2;
   return res[];
+}
+*/
+
+extern(C) {
+  void ray_to_coordsf(int dw, dh, Ray* rayp, float* xp, yp);
+  void coordsf_to_ray(int dw, dh, float x, y, Ray* rayp);
+}
+
+class RandomizeRay : CommandHandler {
+  int src;
+  void init(int src = -1) { this.src = src; }
+  void process(VMState[] list, int start, end) {
+    auto sc = getScale();
+    for int i <- start .. end {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      Ray* ray;
+      if (src == -1) ray = &rayplanes[sp.ray-id-1][i];
+      else ray = &rayplanes[src][i];
+      
+      using sp mixin(allocRay);
+      
+      auto nray = &rayplanes[sp.ray-id-1][i];
+      
+      float fx, fy;
+      ray_to_coordsf(dw, dh, ray, &fx, &fy);
+      // (fx, fy) = vary(fx, fy, 5);
+      // fx += randf() - 0.5;
+      // fy += randf() - 0.5;
+      fx = randf() * dw;
+      fy = randf() * dh;
+      coordsf_to_ray(dw, dh, fx, fy, nray);
+    }
+  }
+}
+
+void delegate(Ray* rayp, vec3f col, bool isBack, float factor, bool isMetroHit) recordResultDg;
+
+void recordState(VMState* sp, int i, int skipRays, skipResults, vec3f v, bool isBack, float bias) {
+  bool record;
+  bool isMetroHit = true;
+  /*if (sp.burnInCounter > 0) sp.burnInCounter --;
+  else */record = true;
+  if (record) { c__2 ++; recordResultDg (&rayplanes[skipRays][i], v, isBack, bias, isMetroHit => isMetroHit); }
+}
+
+class RecordResultStep : CommandHandler {
+  int skipRays, skipResults;
+  void init(int skRay = 0, skRes = 0) (skipRays, skipResults) = (skRay, skRes);
+  void process(VMState[] list, int start, end) {
+    for int i <- start .. end {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      auto v = evaluateRay(sp, i, skipRays, skipResults, isBack => &bool b);
+      recordState(sp, i, skipRays, skipResults, v, b, 1);
+    }
+  }
 }

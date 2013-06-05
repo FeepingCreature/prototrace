@@ -2,20 +2,27 @@ module vm;
 
 import base;
 
-Ray*[] rayplanes;
-Result*[] resplanes;
+Ray[] all_rayplanes;
+int rayplane_size;
+alias rayplanes = [for i <- ints: all_rayplanes[rayplane_size * i .. rayplane_size * (i + 1)]];
+
+Result[] all_resplanes;
+int resplane_size;
+alias resplanes = [for i <- ints: all_resplanes[resplane_size * i .. resplane_size * (i + 1)]];
+
+shared CommandHandler[] fullStream; // used for OpenCL
 
 struct VMState {
-  int result-id, ray-id;
-  
   CommandHandler[] stream;
   
-  int state;
-  float state2;
-  int burnInCounter;
+  int result-id, ray-id;
   
-  vec3f rayCache;
-  bool cached, cachedBack;
+  // int state;
+  // float state2;
+  // int burnInCounter;
+  
+  // vec3f rayCache;
+  // bool cached, cachedBack;
   
   alias handler = stream[0];
   alias allocResult = `{ result-id ++; resplanes[result-id-1][i].success = false; }`;
@@ -31,10 +38,6 @@ struct VMState {
 extern(C) float acosf(float);
 import std.math;
 vec3f evaluateRay(VMState* sp, int i, int firstRay, firstRes, end = 0, bool* isBack = null) {
-  if (sp.cached) {
-    if (isBack) *isBack = sp.cachedBack;
-    return sp.rayCache;
-  }
   // auto rays = sp.rays[firstRay .. $ - end], hits = sp.results[firstRes .. $ - end];
   int numRays = (sp.ray-id - end) - firstRay, numHits = (sp.result-id - end) - firstRes;
   vec3f res = vec3f(0);
@@ -42,7 +45,13 @@ vec3f evaluateRay(VMState* sp, int i, int firstRay, firstRes, end = 0, bool* isB
     writeln "Mismatched call for evaluateRay: $numRays and $numHits";
     asm `int $3`;
   }
-  int start = 0;
+  
+  if (numHits != 1) {
+    assert(false, "got $numHits hits .. what");
+  }
+  return resplanes[firstRes][i].emissive-color;
+  
+  /*int start = 0;
   while (start < numHits && (resplanes[firstRes+start][i]).(success && reflective-color != vec3f(0))) {
     start ++;
   }
@@ -55,6 +64,7 @@ vec3f evaluateRay(VMState* sp, int i, int firstRay, firstRes, end = 0, bool* isB
   Ray* nextRay;
   for (int k = start; k >= 0; --k) {
     auto resp = &resplanes[firstRes+k][i];
+    if (!resp.success) continue;
     float factor = 1;
     // cosine weighting
     if (nextRay && resp.reflective-color != vec3f(0) && res != vec3f(0)) {
@@ -75,7 +85,5 @@ vec3f evaluateRay(VMState* sp, int i, int firstRay, firstRes, end = 0, bool* isB
     //   writeln "$k: $(((*resp).reflective-color, (*resp).emissive-color)) on $oldres => $res";
     nextRay = &rayplanes[firstRay+k][i];
   }
-  sp.cached = true;
-  sp.rayCache = res;
-  return res;
+  return res;*/
 }

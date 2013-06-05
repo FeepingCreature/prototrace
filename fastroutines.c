@@ -63,10 +63,6 @@ void ALIGNED coordsf_to_ray(int dw, int dh, float x, float y, struct Ray *rayp) 
   *(v4sf*) &rayp->dir = (v4sf) res;
 }
 
-void ALIGNED coords_to_ray(int dw, int dh, int x, int y, struct Ray *rayp) {
-  coordsf_to_ray(dw, dh, (float) x, (float) y, rayp);
-}
-
 void ALIGNED ray_to_coordsf(int dw, int dh, struct Ray *rayp, float *xp, float *yp) {
   float ratio = dw * 1.0f / dh;
   v4sf dir = *(v4sf*) &rayp->dir;
@@ -80,21 +76,6 @@ void ALIGNED ray_to_coords(int dw, int dh, struct Ray *rayp, int *xp, int *yp) {
   ray_to_coordsf(dw, dh, rayp, &x, &y);
   *xp = (int) (x + 0.5);
   *yp = (int) (y + 0.5);
-}
-
-void ALIGNED fastsetup(struct Ray **rayplanes, int from, int to, int dw, int dh, int stepsize, struct VMState *state) {
-  // float ratio = dw * 1.0f / dh;
-  struct Ray *rayplane = rayplanes[0];
-  int i = 0;
-  for (int k = from; k < to; ++k) {
-    if (++i != stepsize) continue;
-    i = 0;
-    state->resid = 0;
-    state->rayid = 1;
-    int x = k % dw, y = k / dw;
-    coords_to_ray(dw, dh, x, y, rayplane);
-    state ++; rayplane ++;
-  }
 }
 
 #define SUM(vec) \
@@ -293,46 +274,6 @@ void ALIGNED fast_plane_process(
       res->emissive_col = (vec3f){0,0,0,0};
       res->normal = normal;
     }
-  }
-}
-
-void ALIGNED fast_group_process(
-  struct Ray **rayplanes, struct Result **resplanes,
-  struct VMState *states, int numstates,
-  int len,
-  void* self
-) {
-  if (UNLIKELY(!len)) {
-    for (int i = 0; i < numstates; ++i) {
-      struct VMState* sp = states+i;
-      
-      if (sp->stream_ptr[0] != self) continue;
-      sp->stream_ptr ++; sp->stream_len --;
-      
-      sp->resid ++;
-      resplanes[sp->resid-1][i].success = 0;
-    }
-    return;
-  }
-  for (int i = 0; i < numstates; ++i) {
-    struct VMState* sp = states+i;
-    
-    if (sp->stream_ptr[0] != self) continue;
-    sp->stream_ptr ++; sp->stream_len --;
-    
-    PREFETCH_HARD(&resplanes[sp->resid-2][i].success, 0, 0);
-    PREFETCH_HARD(&resplanes[sp->resid-1][i+1].success, 0, 0);
-    if (!resplanes[sp->resid-1][i].success) { }
-    else if (!resplanes[sp->resid-2][i].success) {
-      resplanes[sp->resid-2][i] = resplanes[sp->resid-1][i];
-    } else {
-      if (resplanes[sp->resid-2][i].distance <= resplanes[sp->resid-1][i].distance) {
-      } else {
-        resplanes[sp->resid-2][i] = resplanes[sp->resid-1][i];
-      }
-    }
-    sp->resid --;
-    continue;
   }
 }
 

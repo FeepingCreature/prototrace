@@ -2,16 +2,40 @@ module scene.group;
 
 import scene.base;
 
-extern(C) void fast_group_process(Ray**, Result**, VMState*, int numstates, int len, void* self);
-
 class Group : SceneObject {
   SceneObject[] list;
   string toString() { return "Group<$(list.length)>"; }
   bool collide(Ray* ray, Result* res) { assert(false); }
-  void process(VMState[] list) {
-    auto len = this.list.length;
-    fast_group_process(rayplanes.ptr, resplanes.ptr, list.ptr, list.length, len, void*:CommandHandler:this);
-    return;
+  void process(VMState[] list, int start, end) {
+    if (!this.list.length) {
+      for int i <- start .. end {
+        ref sp = list[i];
+        if (sp.handler !is CommandHandler:this) continue;
+        sp.stream = sp.stream[1..$];
+        
+        sp.result-id ++;
+        resplanes[sp.result-id-1][i].success = 0;
+      }
+      return;
+    }
+    for int i <- start .. end {
+      ref sp = list[i];
+      if (sp.handler !is CommandHandler:this) continue;
+      sp.stream = sp.stream[1..$];
+      
+      ref res1 = resplanes[sp.result-id-1][i];
+      if (!res1.success) { }
+      else {
+        ref res2 = resplanes[sp.result-id-2][i];
+        if (!res2.success) {
+          res2 = res1;
+        } else {
+          if (res2.distance <= res1.distance) { }
+          else res2 = res1;
+        }
+      }
+      sp.result-id --;
+    }
   }
   CommandHandler[] buildCommandStream(VMStats* stats) {
     CommandHandler[auto~] res;

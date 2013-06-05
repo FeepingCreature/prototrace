@@ -22,50 +22,50 @@ int mylog2(float f) {
   return res;
 }
 
-byte[] encodeHDR(vec3f[] data, int w, h) {
-  byte[auto~] res;
-  res ~= byte[]:"#?RADIANCE\n";
-  res ~= byte[]:"# Made with ProtoTrace\n";
-  res ~= byte[]:"FORMAT=32-bit_rle_rgbe\n";
-  res ~= byte[]:"\n";
-  res ~= byte[]:"-Y $h +X $w\n";
+ubyte[] encodeHDR(vec3f[] data, int w, h) {
+  ubyte[auto~] res;
+  res ~= ubyte[]:"#?RADIANCE\n";
+  res ~= ubyte[]:"# Made with ProtoTrace\n";
+  res ~= ubyte[]:"FORMAT=32-bit_rle_rgbe\n";
+  res ~= ubyte[]:"\n";
+  res ~= ubyte[]:"-Y $h +X $w\n";
   auto scanline = new ubyte x 4[] w;
   onSuccess scanline.free;
   for (int y <- 0..h) {
     // wth
-    res ~= byte:2; // i
-    res ~= byte:2; // grn
-    res ~= byte:(w >> 8);
-    res ~= byte:(w & 0xff);
+    res ~= ubyte:2; // i
+    res ~= ubyte:2; // grn
+    res ~= ubyte:(w >> 8);
+    res ~= ubyte:(w & 0xff);
     // build scanline
     auto line = data[y*w .. (y+1)*w];
     for (int x <- 0..w) {
       auto exp1 = mylog2(line[w - 1 - x].x), exp2 = mylog2(line[w - 1 - x].y), exp3 = mylog2(line[w - 1 - x].z);
       auto exp = exp1.max(exp2).max(exp3);
       if (exp == -128) {
-        scanline[x][(0, 1, 2, 3)] = byte:0 x 4;
+        scanline[x][(0, 1, 2, 3)] = ubyte:0 x 4;
       } else {
         auto rfactor = ipow(2, exp);
         exp += 128;
         assert(0 <= exp < 256);
         auto vec = line[w - 1 - x] / rfactor;
-        scanline[x][0] = byte:int:c.math.floorf (vec.x * 256);
-        scanline[x][1] = byte:int:c.math.floorf (vec.y * 256);
-        scanline[x][2] = byte:int:c.math.floorf (vec.z * 256);
-        scanline[x][3] = byte:exp;
+        scanline[x][0] = ubyte:int:c.math.floorf (vec.x * 256);
+        scanline[x][1] = ubyte:int:c.math.floorf (vec.y * 256);
+        scanline[x][2] = ubyte:int:c.math.floorf (vec.z * 256);
+        scanline[x][3] = ubyte:exp;
       }
     }
     auto parts = scanline.length / 127, rem = scanline.length - parts * 127;
     for (int c <- 0..4) {
       int k;
       for (int i <- 0..parts) {
-        res ~= byte:127;
+        res ~= ubyte:127;
         for (0..127)
-          res ~= byte:scanline[k++][c];
+          res ~= ubyte:scanline[k++][c];
       }
-      res ~= byte:rem;
+      res ~= ubyte:rem;
       for (0..rem)
-        res ~= byte:scanline[k++][c];
+        res ~= ubyte:scanline[k++][c];
     }
   }
   return res[];
@@ -87,7 +87,7 @@ HdrTex* parseHDR(ubyte[] data, string fn) {
     }
   }
   writeln "Read $w x $h ($fn)";
-  res.data = (vec3f*:aligned_calloc (w * h * size-of vec3f))[0..w*h];
+  res.data = new vec3f[] w * h;
   auto scanline = new ubyte x 4[] w;
   alias takeNextChar = data[(0, 1..$)];
   alias takeNextChar2 = data[(0, 1, 2..$)];

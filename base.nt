@@ -30,13 +30,19 @@ struct Result {
   vec2f texcoord; Texture* texinfo;
   int data;
   bool success;
+  void claim() {
+    success = true;
+    reflective-color = vec3f 1;
+    emissive-color = vec3f 0;
+  }
   string toString() {
     if (success) {
-      return "[res: hit at $distance: nor $normal, col $col]";
+      return "[res: hit at $distance: nor $normal, col $col, emit $emissive-color]";
     } else {
       return "[res: no hit]";
     }
   }
 }
+
 
 interface CommandHandler;

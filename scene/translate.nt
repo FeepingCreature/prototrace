@@ -2,14 +2,12 @@ module scene.translate;
 
 import scene.base;
 
-extern(C) void fast_translate_process(Ray**, Result**, VMState*, int numstates, vec3f vector, void* self);
-
 class Translate : SceneObject {
   vec3f vector;
   SceneObject sup;
   class PostTranslate : CommandHandler {
-    void process(VMState[] list) {
-      for int i <- 0 .. list.length {
+    void process(VMState[] list, int start, end) {
+      for int i <- start .. end {
         auto sp = &list[i];
         
         if (void*:sp.handler == void*:CommandHandler:this)::
@@ -26,10 +24,8 @@ class Translate : SceneObject {
     ray2.dir = ray.dir;
     return sup.collide(&ray2, res);
   }
-  void process(VMState[] list) {
-    fast_translate_process(rayplanes.ptr, resplanes.ptr, list.ptr, list.length, vector, void*:CommandHandler:this);
-    return;
-    for int i <- 0 .. list.length {
+  void process(VMState[] list, int start, end) {
+    for int i <- start .. end {
       auto sp = &list[i];
       
       if (void*:sp.handler == void*:CommandHandler:this)::

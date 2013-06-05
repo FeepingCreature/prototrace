@@ -8,8 +8,8 @@ class Shine : SceneObject {
   vec3f col;
   void init(vec3f col, SceneObject so) { sup = so; this.col = col; }
   bool collide(Ray* ray, Result* res) { raise new Error "Shine::collide not implemented! "; }
-  void process(VMState[] list) {
-    for int i <- 0..list.length {
+  void process(VMState[] list, int start, end) {
+    for int i <- start..end {
       auto sp = &list[i];
       
       if (void*:sp.handler == void*:CommandHandler:this)::
@@ -30,8 +30,8 @@ class Color : SceneObject {
   vec3f col;
   void init(vec3f col, SceneObject so) { sup = so; this.col = col; }
   bool collide(Ray* ray, Result* res) { raise new Error "Color::collide not implemented! "; }
-  void process(VMState[] list) {
-    for int i <- 0..list.length {
+  void process(VMState[] list, int start, end) {
+    for int i <- start..end {
       auto sp = &list[i];
       
       if (void*:sp.handler == void*:CommandHandler:this)::

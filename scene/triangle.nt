@@ -18,10 +18,9 @@ class Triangle : SceneObject {
     if (dist < 0) return false;
     auto p = ray.pos + ray.dir * dist;
     // thanks, http://www.blackpawn.com/texts/pointinpoly/default.html !
-    xmm[4] = ca;
-    xmm[5] = ba;
-    xmm[6] = p - a;
-    alias v0 = xmm[4], v1 = xmm[5], v2 = xmm[6];
+    auto v0 = ca;
+    auto v1 = ba;
+    auto v2 = p - a;
     float
       dot00 = v0 * v0 #.sum,
       dot01 = v0 * v1 #.sum,
@@ -39,9 +38,8 @@ class Triangle : SceneObject {
   }
   void process(VMState[] list) {
     vec3f normal = n.normalized;
-    xmm[4] = ca;
-    xmm[5] = ba;
-    alias v0 = vec3f:xmm[4], v1 = vec3f:xmm[5];
+    auto v0 = ca;
+    auto v1 = ba;
     float
       dot00 = v0 * v0 #.sum,
       dot01 = v0 * v1 #.sum,
@@ -63,8 +61,7 @@ class Triangle : SceneObject {
       else {
         auto p = pos + dist * dir;
         
-        xmm[6] = p - a;
-        alias v2 = vec3f:xmm[6];
+        auto v2 = p - a;
         
         float
           dot02 = v0 * v2 #.sum,
@@ -171,7 +168,7 @@ struct TriangleNode {
         }
       } else {
         slab = void*:round16(int:slab + size-of TriangleNode);
-        res.info = int*:slab #[0..info.length];
+        res.info = type-of res.info:$ int*:slab #[0..info.length];
         slab = void*:round16 (int:slab + info.length * size-of int);
         for int i <- 0..info.length
           res.info[i] = info[i];
@@ -202,12 +199,11 @@ struct TriangleNode {
     aabb.addPoint tlist[t].c;
   }
   TriangleNode* trySplitTris(int axis) {
-    auto res = TriangleNode*:aligned_calloc size-of TriangleNode;
+    auto res = new TriangleNode;
     res.aabb = aabb;
     
-    auto left = TriangleNode*:aligned_calloc size-of TriangleNode;
-    auto right = TriangleNode*:aligned_calloc size-of TriangleNode;
-    res.children = TriangleNode**:aligned_calloc (2 * size-of TriangleNode*) #[0..2];
+    auto left = new TriangleNode, right = new TriangleNode;
+    res.children = new TriangleNode*[] 2;
     res.children[0] = left;
     res.children[1] = right;
     
@@ -273,7 +269,7 @@ struct TriangleNode {
 int[] tricache;
 int hash;
 
-extern(C) void fast_triangleset_process(Ray**, Result**, VMState*, int, TriangleInfo* info, TriangleNode *root, int* tricache, int *hashp, void* self);
+// extern(C) void fast_triangleset_process(Ray**, Result**, VMState*, int, TriangleInfo* info, TriangleNode *root, int* tricache, int *hashp, void* self);
 
 class TriangleSet : SceneObject {
   TriangleNode* root;
@@ -308,12 +304,12 @@ class TriangleSet : SceneObject {
   void flatten() {
     auto size = int:root.linearAllocate();
     // writeln "full slab size = $size";
-    void* ptr = aligned_calloc size;
+    void* ptr = mem.calloc (1, size);
     root = TriangleNode*: root.linearAllocate(&ptr);
-    auto new_info = TriangleInfo*: aligned_calloc (info.length * size-of TriangleInfo);
+    auto new_info = new TriangleInfo[] info.length #.ptr;
     for int i <- 0..info.length
       new_info[i] = info[i];
-    info = new_info[0..info.length];
+    info = type-of info: new_info[0..info.length];
   }
   void optimize() {
     tlist = info[];
@@ -324,7 +320,7 @@ class TriangleSet : SceneObject {
     // ray hits both children: 2 tests + 4 at the next level = 6 tests => 4 tests
     void two_to_four(TriangleNode* tnode) {
       if (tnode.(children.length == 2 && children[0].children.length == 2 && children[1].children.length == 2)) {
-        auto newchildren = TriangleNode**:aligned_calloc (4 * size-of TriangleNode*) #[0..4];
+        auto newchildren = new TriangleNode*[] 4;
         for (int i1, (int i2, int i3)) <- zip(0..4, cross(0..2, 0..2))
           newchildren[i1] = tnode.children[i2].children[i3];
         tnode.children = newchildren;
@@ -338,7 +334,8 @@ class TriangleSet : SceneObject {
   bool collide(Ray* ray, Result* res) { _interrupt 3; }
   void process(VMState[] list) {
     if (tricache.length != info.length) { tricache.free; tricache = new int[] info.length; }
-    fast_triangleset_process(rayplanes.ptr, resplanes.ptr, list.ptr, list.length, info.ptr, root, tricache.ptr, &hash, void*:CommandHandler:this);
+    assert(false);
+    // fast_triangleset_process(rayplanes.ptr, resplanes.ptr, list.ptr, list.length, info.ptr, root, tricache.ptr, &hash, void*:CommandHandler:this);
   }
   CommandHandler[] buildCommandStream(VMStats* stats) {
     stats.needsResult;

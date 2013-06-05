@@ -1,0 +1,249 @@
+module scene.lighting;
+
+import scene.base, scene.util;
+
+class LightStep : CommandHandler {
+  vec3f* lightpos;
+  int numBasicSteps;
+  void init(vec3f* lp, int n) { lightpos = lp; numBasicSteps = n; }
+  class LightMergeStep : CommandHandler {
+    void process(VMState[] list, int start, end) {
+      for int i <- start .. end {
+        auto sp = &list[i];
+        
+        if (void*:sp.handler == void*:CommandHandler:this)::
+        sp.stream = sp.stream[1..$];
+        
+        ref res = resplanes[sp.result-id-2][i];
+        if (res.success) {
+          ref ray1 = rayplanes[sp.ray-id-1][i];
+          ref ray2 = rayplanes[sp.ray-id-2][i];
+          vec3f lightdir = (*lightpos) - ray1.pos;
+          float lightdist = |lightdir|;
+          lightdir = lightdir.normalized;
+          auto norm = res.normal;
+          if ((norm * ray2.dir).sum > 0)
+            norm = -norm;
+          vec3f lightprod = lightdir * norm;
+          float lightangle = lightprod.sum;
+          
+          vec3f resv = vec3f(0);
+          auto res2 = &resplanes[sp.result-id-1][i];
+          if (lightangle >= 0 && (!res2.success || res2.distance >= lightdist))
+            resv = res.reflective-color * vec3f(lightangle);
+          
+          res.emissive-color += resv;
+        }
+        using sp mixin(freeResult.replace("!!", "1"));
+        using sp mixin(freeRay.replace("!!", "1"));
+      }
+    }
+  }
+  LightMergeStep mkMergeStep() { return new LightMergeStep; }
+  void process(VMState[] list, int start, end) {
+    for int i <- start .. end {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      auto res = &resplanes[sp.result-id-1][i];
+      if (res.success) {
+        auto ray = &rayplanes[sp.ray-id-1][i];
+        auto nspos = ray.(pos + dir * (res.distance * EPS));
+        // writeln "nspos = $(sp.ray.(pos, dir)) @ $(res.distance) = $(nspos), lightpos $(*lightpos)";
+        using sp mixin(allocRay);
+        vec3f lightdir = ((*lightpos) - nspos).normalized;
+        ray = &rayplanes[sp.ray-id-1][i];
+        ray.(pos, dir) = (nspos, lightdir);
+      } else {
+        using sp mixin(allocRay);
+        using sp mixin(allocResult);
+        sp.stream = sp.stream[numBasicSteps .. $]; // skip
+      }
+    }
+  }
+}
+
+void generateOutRay(Ray* ray, Ray* prev-ray, vec3f start, Result* resinfo) {
+  ray.(pos, dir) = (start, rand_sphere());
+  auto normal = resinfo.normal;
+  // flip the normal if we approached the surface from the "backside"
+  // this accounts for things like triangle models where a triangle may be visible from both sides
+  // on an unrelated note, fuck those bullshit models
+  if ((normal * prev-ray.dir).sum >= 0)
+    normal = -normal;
+  
+  if (ray.dir * normal).sum < 0 ray.dir = -ray.dir;
+}
+
+class PathTraceStep : CommandHandler {
+  int skip, res-delta;
+  int skip-start;
+  void init(int rd = 0) { res-delta = rd; skip-start = -1; skip = -1; }
+  void startTracking(int at) {
+    skip-start = at;
+  }
+  class PathTraceMergeStep : CommandHandler {
+    void process(VMState[] list, int start, end) {
+      for int i <- start .. end {
+        auto sp = &list[i];
+        
+        if (sp.handler !is CommandHandler:this) continue;
+        sp.stream = sp.stream[1..$];
+        
+        ref res = resplanes[sp.result-id-2][i];
+        if (res.success) {
+          ref res2 = resplanes[sp.result-id-1][i];
+          if (res2.success) {
+            res.emissive-color += res.reflective-color * res2.emissive-color;
+          } else {
+            // res.emissive-color += vec3f(1, 0, 0);
+          }
+        }
+        // using sp mixin(freeResult.replace("!!", "1"));
+      }
+    }
+  }
+  void stopTracking(int at) {
+    assert(skip-start != -1);
+    auto delta = (at - skip-start);
+    skip = delta;
+  }
+  auto mkMergeStep() {
+    assert(skip != -1);
+    return new PathTraceMergeStep;
+  }
+  void process(VMState[] list, int start, end) {
+    for int i <- start .. end {
+      auto sp = &list[i];
+      
+      if (sp.handler !is CommandHandler:this) continue;
+      sp.stream = sp.stream[1..$];
+      
+      using sp mixin(allocRay);
+      
+      ref res = resplanes[sp.result-id-1 - res-delta][i];
+      if (res.success && res.reflective-color != vec3f(0)) {
+        ref ray = rayplanes[sp.ray-id-2][i];
+        ref ray2 = rayplanes[sp.ray-id-1][i];
+        auto nspos = ray.(pos + dir * (res.distance * EPS));
+        // writeln "nspos = $(ray.(pos, dir)) @ $(res.distance) = $(nspos)";
+        generateOutRay(&ray2, &ray, nspos, &res);
+      } else {
+        using sp mixin(allocResult);
+        ref res2 = resplanes[sp.result-id-1][i];
+        res2.success = false;
+        sp.stream = sp.stream[skip .. $]; // no point
+      }
+    }
+  }
+}
+
+class LightSource : SceneObject {
+  SceneObject sup;
+  vec3f* ls;
+  void init(vec3f* ls, SceneObject sup) this.(ls, sup) = (ls, sup);
+  CommandHandler[] buildCommandStream(VMStats* stats) {
+    stats.needsResult;
+    stats.needsRay;
+    auto stream = sup.buildCommandStream(stats);
+    stats.results-needed-cur --;
+    stats.rays-needed-cur --;
+    using new LightStep(ls, stream.length)
+      return stream ~ that ~ stream ~ mkMergeStep();
+  }
+}
+
+class PathTraceLighting : SceneObject {
+  SceneObject sup, sup2; int avg, depth;
+  void init(SceneObject sup, int depth) { init(1, sup, sup, depth); }
+  void init(SceneObject sup, sup2, int depth) { init(1, sup, sup, depth); }
+  void init(int avg, SceneObject sup, int depth) { init(avg, sup, sup, depth); }
+  void init(int avg, SceneObject sup, sup2, int depth) this.(sup, sup2, avg, depth) = (sup, sup2, avg, depth);
+  CommandHandler[] buildCommandStream(VMStats* stats) {
+    auto backupstats = *stats;
+    onSuccess {
+      if (backupstats.(results-needed-cur + 1 != stats.results-needed-cur
+                     ||rays-needed-cur != stats.rays-needed-cur))
+      {
+        writeln "unbalanced - $(stats.(results-needed-cur, rays-needed-cur)) but $(backupstats.(results-needed-cur, rays-needed-cur))";
+        fail;
+      }
+    }
+    
+    CommandHandler[auto~] res;
+    
+    auto stream = sup.buildCommandStream(stats);
+    res ~= stream; // results ++
+    void buildChain(int depth) {
+      PathTraceStep[auto~] steps; // track them forward ..
+      for 0..depth {
+        stats.needsRay;
+        auto pts = new PathTraceStep; // rays ++
+        
+        steps ~= pts;
+        res ~= pts;
+        pts.startTracking(res.length);
+        res ~= sup2.buildCommandStream(stats); // results ++
+      }
+      
+      for int i <- 0..depth {
+        ref step = steps[$-1 - i];
+        step.stopTracking(res.length + 1); // skip the merge step also
+        res ~= step.mkMergeStep();
+        stats.results-needed-cur --;
+        res ~= new FreeResult; // results --
+        stats.rays-needed-cur --;
+        res ~= new FreeRay; // rays --
+      }
+      
+      // summary: neutral
+    }
+    assert(depth >= 1);
+    if (avg == 1) {
+      buildChain depth;
+    } else {
+      int base-id = stats.results-needed-cur;
+      stats.needsResult;
+      auto stream2 = sup2.buildCommandStream(stats);
+                                  // if skipping, there's really no need to do the average step either
+      auto pt = new PathTraceStep(1 /* skip one result (our empty averager) */);
+      auto fr = new FreeRay;
+      auto as = new AverageStep (avg, base-id, base-id + 1);
+      auto fs = new FreeResult;
+      res ~= new AllocEmptyResult; // results ++
+      for (int i = 0; i < avg; ++i) {
+        stats.needsRay;
+        res ~= pt; // rays ++
+        pt.startTracking(res.length);
+        res ~= stream2; // results ++
+        buildChain(depth - 1);
+        res ~= as;
+        pt.stopTracking(res.length);
+        stats.rays-needed-cur --;
+        res ~= fr; // rays --
+        res ~= fs; // results --
+      }
+      stats.results-needed-cur -= 2; // free twice
+      res ~= pt.mkMergeStep();
+      res ~= fs; // results --
+      // neutral
+    }
+    res ~= new RecordResultStep;
+    return res[];
+  }
+}
+
+class PlainLighting : SceneObject {
+  SceneObject sup;
+  void init(SceneObject sup) this.sup = sup;
+  CommandHandler[] buildCommandStream(VMStats* stats) {
+    auto stream = sup.buildCommandStream(stats);
+    
+    CommandHandler[auto~] res;
+    res ~= stream;
+    res ~= new RecordResultStep;
+    return res[];
+  }
+}

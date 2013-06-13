@@ -1,0 +1,16 @@
+module test;
+
+import std.lib.libedit;
+void main() {
+  set-handler (LinuxSignal ls) { if (ls.id == c.signal.SIGINT) invoke-exit "return"; }
+  define-exit "return" return;
+  
+  auto stream = reader();
+  onExit stream.close;
+  
+  prompt = "%) ";
+  for auto line <- stream {
+    writeln "$line";
+    stream.addHistory line;
+  }
+}

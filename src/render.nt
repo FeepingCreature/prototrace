@@ -1,0 +1,467 @@
+module render;
+
+pragma(linker, "fastroutines.o");
+
+import base, scene.(base, util, texture, metro, sphere);
+import std.(string, file, thread, time, lib.opengl, macros.swap, process);
+import sdl, c.fenv;
+
+extern(C) {
+  void ray_to_coords(int dw, dh, Ray* rayp, int* xp, yp);
+  float fov;
+  int feenableexcept(int);
+}
+
+shared int markovSteps, burnInLimit;
+shared float minBrightnessFactor;
+shared (int, int) dbgPos;
+shared bool break-on-float-errors;
+
+shared int iters; shared long rays;
+
+import gd;
+Texture* readImage(string fname) {
+  if (!fname.exists()) {
+    if      exists auto asPNG = "$fname.png" fname = asPNG;
+    else if exists auto asJPG = "$fname.jpg" fname = asJPG;
+    else if exists auto asHDR = "$fname.hdr" fname = asHDR;
+    else raise new Error "No such image: $fname";
+  }
+  auto res = new Texture;
+  auto fdata = readAll fname;
+  if (fname.toLower().endsWith ".jpg") { res.gdp = gdImageCreateFromJpegPtr(fdata.(length, ptr)); return res; }
+  if (fname.toLower().endsWith ".png") { res.gdp = gdImageCreateFromPngPtr(fdata.(length, ptr)); return res; }
+  if (fname.toLower().endsWith ".hdr") { res.hdp = parseHDR(fdata, fname); return res; }
+  raise new Error "Unknown extension in '$fname'! ";
+}
+
+alias atoi = std.string.atoi;
+alias atof = std.string.atof;
+alias rand = scene.util.rand;
+
+void init() using settings {
+  desired-fps = 0.5;
+  threads = 4;
+  samples = 1;
+  file = "out.png";
+  stepsize = 1;
+  dbgPos = (-1, -1);
+  markovSteps = 512;
+  // burnInLimit = 128;
+  burnInLimit = 0;
+  minBrightnessFactor = 0;
+  useBoehm = false;
+  allowLensmut = true;
+  depth = 10;
+  savestep = 4;
+  // empirically determined to be fastest thereabouts. not sure why.
+  // here's a quick&dirty benchmark
+  /*
+    for t in {1..16}
+    do
+      GRP=$((1 << t))
+      TT=$(/usr/bin/time -p ./pt -r "1024x1024" -g $GRP 2>&1 |grep ^user |cut -d\  -f2)
+      echo "$GRP $TT"
+    done
+  */
+  groupsize = 256;
+}
+
+shared context settings {
+  float desired-fps;
+  int threads; // number of subdivisions
+  int samples;
+  (int, int) imgres; // fixed-size single-pass render
+  string file;
+  int stepsize;
+  bool average, useBoehm, saveFrames;
+  int depth;
+  string input;
+  float savestep;
+  int groupsize;
+  // computed
+  alias xgroupsize = groupsize * stepsize;
+  int rays-needed, results-needed;
+}
+
+void saveAs(string file, vec4f[] resbuffer, bool finalCall = false) {
+  float avg_w = 0; int sum;
+  for (int k <- 0..dw*dh) {
+    if (resbuffer[k].(w != 1 && w > 0)) {
+      avg_w += resbuffer[k].w;
+      sum ++;
+    }
+  }
+  if (!sum) {
+    writeln "Too early to save file.";
+    return;
+  }
+  avg_w /= sum;
+  /*float max_x = 0;
+  for (int k <- 0..dw*dh) {
+    if (auto x = resbuffer[k].x) > max_x max_x = x;
+  }
+  if (max_x == 0f) max_x = 1;*/
+  if (file.endsWith(".hdr")) {
+    auto colbuffer = new vec3f[] (dw * dh);
+    if (settings.average) {
+      for (int k <- 0..dw*dh) {
+        colbuffer[k] = resbuffer[k].(xyz/avg_w);
+      }
+    } else {
+      for (int k <- 0..dw*dh) {
+        colbuffer[k] = resbuffer[k].(xyz/w);
+      }
+    }
+    auto data = encodeHDR(colbuffer, dw, dh);
+    colbuffer.free;
+    writeAll(file, data);
+    data.free;
+    return;
+  }
+  auto gdp = gdImageCreateTrueColor(settings.imgres);
+  onSuccess gdImageDestroy gdp;
+  for (int k <- 0..dw*dh) {
+    vec3f col;
+    if (settings.average) {
+      col = resbuffer[k].(xyz/avg_w);
+    } else {
+      col = resbuffer[k].(xyz/w);
+    }
+    float maxf(float a, b) return [a, b][b > a];
+    if (col.(maxf(x, maxf(y, z))) > 1)
+      col /= col.(maxf(x, maxf(y, z)));
+    // col = resbuffer[k].xxx / max_x;
+    int x = k % dw, y = k / dw;
+    gdp.tpixels[y][dw - 1 - x] = floatToIntColor col;
+  }
+  auto hdl = fopen (file.toStringz(), "w");
+  gdImagePng(gdp, c.gd.FILE*: hdl);
+  fclose hdl;
+}
+
+float value(vec3f v, bool isBack) {
+  alias r = v.x, g = v.y, b = v.z;
+  auto res = r * 0.2 + g * 0.3 + b * 0.5;
+  if (isBack && res > 0.05) res = 0.05; // sanity limit for background
+  // if (isBack) res /= 10K;
+  return res;
+}
+
+alias AllThreadsMap = (Ray[], Result[], VMState[])[];
+
+void render(int thread, int id, AllThreadsMap ray-res-vm-map, vec4f[] resbuffer) {
+  alias my-ray-map = ray-res-vm-map[thread][0];
+  alias my-res-map = ray-res-vm-map[thread][1];
+  alias my-vm-map = ray-res-vm-map[thread][2];
+  int count = settings.groupsize;
+  int xgroupsize = settings.xgroupsize;
+  
+  int from = id * xgroupsize, to = (id+1) * xgroupsize;
+  
+  using scoped recordResultDg::
+  recordResultDg = delegate void(Ray* rayp, vec3f col, bool isBack, float factor, bool isMetroHit) {
+    ray_to_coords(dw, dh, rayp, &int x, &int y);
+    
+    auto i = y * dw + x;
+    if (i >= dw*dh || i < 0) return;
+    ref rb = resbuffer[i];
+    float icolf = 1;
+    auto coln = col * icolf;
+    // writeln "record @$((x, y)): $(vec4f(coln.(x, y, z, icolf))) for $(col)";
+    // writeln "at $((x, y)), record $(vec4f(coln.(x, y, z, icolf))) for $(col), adding to $(rb)";
+    if (x == dbgPos[0] && y == dbgPos[1]) {
+      writeln "at $((x, y)), record $(vec4f(coln.(x, y, z, icolf))) * $factor for $(col), adding to $(rb)";
+    }
+    rb += vec4f(coln.(x, y, z, icolf)) * factor;
+  };
+  // split into subfunctions for the benefit of the profiler.
+  void setup() {
+    auto xstream = vm.fullStream;
+    int resn = settings.results-needed, rayn = settings.rays-needed;
+    // prealloc vm, results, rays
+    if (my-vm-map.length != count) {
+      my-vm-map.free;
+      my-vm-map = new VMState[] (count);
+    }
+    if (my-ray-map.length != count * rayn) {
+      my-ray-map.free;
+      my-ray-map = new Ray[] (count*rayn);
+    }
+    if (my-res-map.length != count * resn) {
+      my-res-map.free;
+      my-res-map = new Result[] (count*resn);
+    }
+    Ray[] ray-slab = my-ray-map;
+    Result[] res-slab = my-res-map;
+    // memset(res-slab.ptr, 0, res-slab.length * size-of Result);
+    // sabotage - enable if you suspect you have misbehaving objects
+    // using uninitialized results. Or else just enable the memset above.
+    /*for ref val <- res-slab using val {
+      // distance = rand();
+      // normal = (rand(), rand(), rand());
+      // reflective-color = (rand(), rand(), rand());
+      emissive-color = (rand(), rand(), rand());
+      // data = rand();
+      success = rand() % 2;
+    }*/
+    
+    auto state = my-vm-map.ptr;
+    
+    (all_rayplanes, ray-slab) = ray-slab[(0..count * rayn, count * rayn .. $)];
+    (all_resplanes, res-slab) = res-slab[(0..count * resn, count * resn .. $)];
+    rayplane_size = count;
+    resplane_size = count;
+    initPlaneMaps;
+    
+    int i;
+    auto rayplane = rayplanes[0].ptr;
+    auto stepsz = settings.stepsize;
+    for (int k <- from..to) {
+      if (++i != stepsz) continue;
+      i = 0;
+      int x = k % dw, y = k / dw;
+      coordsf_to_ray(dw, dh, x, y, rayplane);
+      state.stream = xstream;
+      using state {
+        result-id = 0;
+        ray-id = 1;
+      }
+      state ++;
+      rayplane ++;
+    }
+  }
+  void check() {
+    if (!(mxcsr & (1 << 15))) {
+      writeln "Oops! FTZ has gotten 0. Resetting. $(mxcsr)";
+      // _interrupt 3;
+      // rtz, fz
+      mxcsr |= (3 << 13) | (1 << 15);
+      if (break-on-float-errors)
+        for auto val <- [FE_DIVBYZERO, FE_INVALID/*, FE_OVERFLOW .. infs are fine*/]
+          feenableexcept val;
+    }
+  }
+  void process() {
+    check;
+    auto rayqueue = my-vm-map;
+    int base;
+    do {
+      // This must proceed backwards! The handlers use i as index into the planes!
+      while (rayqueue.length && !rayqueue[$-1].handler) rayqueue = rayqueue[0 .. $-1];
+      while (base < rayqueue.length && !rayqueue[base].handler) base ++;
+    } while (base < rayqueue.length) {
+      auto hdl = rayqueue[base].stream.ptr;
+      int start = base, end = rayqueue.length;
+      /*int num;
+      for auto rq <- rayqueue if int:rq.handler == int:*hdl num++;
+      writeln "$(*hdl): $num out of $(rayqueue.length)";*/
+      // writeln "apply $(*hdl): $(rayqueue[base].result-id)";
+      
+      hdl.process (rayqueue, start, end);
+    }
+  }
+  setup();
+  process();
+}
+
+void renderSceneToScreenDynamic(CommandHandler[] stream) {
+  float ratio = 1;
+  // if (settings.imgres[0]) ratio = settings.imgres.(_0 * 1f / _1);
+  
+  (int, int) desired-display-size;
+  // if (settings.(imgres[0] && imgres[1])) desired-display-size = settings.imgres;
+  
+  getScale = λ() -> 2.0f * vec2f(ratio, 1) / vec2f(desired-display-size);
+  
+  vec4f[] resbuffer;
+  auto resbuffer-lock = new ReadWriteLock;
+  
+  auto ray-res-vm-map = new (Ray[], Result[], VMState[])[] settings.threads;
+  
+  auto surf = screen(640, 480, surface => true);
+  desired-display-size = surf.(w, h);
+  
+  resbuffer = new vec4f[] surf.(w * h);
+  resbuffer[] = [for 0..resbuffer.length: vec4f.W];
+  
+  onResize(800, 600);
+  bool stop;
+  
+  auto lp = new LoopPool settings.threads;
+  
+  auto start = sec(), firststart = start;
+  
+  using new ThreadPool 1::
+  addTask delegate void() {
+    auto last-printed = sec();
+    while !stop {
+      resbuffer-lock.lock-read();
+        auto ddsx = desired-display-size[0], ddsy = desired-display-size[1], xgroupsize = settings.xgroupsize;
+        int total = (ddsx * ddsy) / xgroupsize;
+        // writeln "run loop to $total: $ddsx $ddsy $xgroupsize";
+        lp.runLoop(total, delegate void(int id, thr) {
+          set-handler (UnrecoverableError uerr) {
+            writeln "$(read-pretty-fcc-backtrace())\n$uerr. Aborting. ";
+            invoke-exit "exit";
+          }
+          define-exit "exit" { exit(1); }
+          (dw, dh) = desired-display-size;
+          render(thr, id, ray-res-vm-map, resbuffer);
+        });
+      resbuffer-lock.unlock();
+      iters ++;
+      rays += surf.(w*h);
+      // render();
+      auto delta = float:(sec() - start);
+      auto fulldelta = float:(sec() - firststart);
+      float fps;
+      if (delta > 0) fps = iters / delta;
+      else fps = 0.001; // eps
+      // reconfigure window size to reach target fps
+      import c.math;
+      float pixelfactor = settings.desired-fps / fps, psq = sqrtf pixelfactor;
+      float absf(float f) { if (f < 0) return -f; return f; }
+      if (float:(sec() - last-printed) > 5) {
+        writeln "[fps $fps] [wanted $(settings.desired-fps)] [res $desired-display-size] [speed $(surf.(w*h) * iters / delta / 1_000_000)mrps] [full speed $(double:rays / fulldelta / 1_000_000)mrps]";
+        last-printed = sec();
+      }
+      alias acceptedDelta = 0.5;
+      if (absf (pixelfactor - 1) > acceptedDelta && delta > 1) {
+        if (psq < 0.7) psq = 0.7;
+        (int, int) updated-size = (int:(surf.w / psq), int:(surf.h / psq));
+        updated-size = (updated-size[0] / 10 #* 10, updated-size[1] / 10 #* 10);
+        if (updated-size[0] != desired-display-size[0] && updated-size[1] != desired-display-size[1]) {
+          resbuffer-lock.lock-write();
+            desired-display-size = updated-size;
+            resbuffer.free;
+            resbuffer = new vec4f[] (updated-size[0] * updated-size[1]);
+            resbuffer[] = [for 0..resbuffer.length: vec4f.W * 0.0001]; // so that xyz/w doesn't error
+          resbuffer-lock.unlock();
+        }
+        // reset estimation
+        iters = 0; start = sec();
+      }
+    }
+  }
+  set-handler(Error err) {
+    writeln "$err. Exiting. ";
+    invoke-exit "main-return";
+  }
+  define-exit "main-return" {
+    stop = true;
+    waitComplete;
+    return;
+  }
+  auto begin = sec();
+  int tex;
+  glGenTextures(1, &tex);
+  onSuccess glDeleteTextures(1, &tex);
+  while (true) {
+    auto start-draw = sec();
+    resbuffer-lock.lock-read();
+    dw = surf.w; dh = surf.h;
+    scope colors = new vec3f[] (dw*dh);
+    for (int k <- 0..dw*dh) {
+      auto col = resbuffer[k].(xyz/w);
+      float maxf(float a, b) return [a, b][b > a];
+      if (col.(maxf(x, maxf(y, z))) > 1)
+        col /= col.(maxf(x, maxf(y, z)));
+      colors[k] = col;
+    }
+    resbuffer-lock.unlock();
+    using mode GL {
+      Viewport (0, 0, display.(w, h));
+      MatrixMode PROJECTION;
+      LoadIdentity;
+      MatrixMode MODELVIEW;
+      LoadIdentity;
+      using TEXTURE_2D {
+        Enable;
+        BindTexture tex;
+        TexParameteri(TEXTURE_MIN_FILTER, NEAREST);
+        TexParameteri(TEXTURE_MAG_FILTER, NEAREST);
+        TexImage2D (0, 3, dw, dh, 0, RGBA, FLOAT, colors.ptr);
+      }
+      ClearColor (1, 1, 0, 0);
+      Clear (COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT);
+      
+      using Quads {
+        Vertex2f( 1, -1); TexCoord2f(0, 0);
+        Vertex2f( 1,  1); TexCoord2f(1, 0);
+        Vertex2f(-1,  1); TexCoord2f(1, 1);
+        Vertex2f(-1, -1); TexCoord2f(0, 1);
+      }
+    }
+    surf.surf.flip;
+    SDL_GL_SwapBuffers();
+    flip;
+    if (mouse-clicked) writeln "click: $(mouse-pos)";
+    auto end-draw = sec();
+    auto should-take = 1f / settings.desired-fps, delta = should-take-end-draw+start-draw /* abusive */;
+    if (should-take > 0)
+      sleep should-take;
+    if (surf.(w != desired-display-size[0] || h != desired-display-size[1])) {
+      surf = screen (desired-display-size, surface => true);
+    }
+  }
+}
+
+void renderSceneToFile(CommandHandler[] stream) {
+  auto lp = new LoopPool settings.threads;
+  
+  auto ray-res-vm-map = new (Ray[], Result[], VMState[])[] settings.threads;
+  
+  vec4f[] resbuffer = new vec4f[] (settings.imgres.(_0 * _1));
+  // so that xyz/w doesn't error
+  resbuffer[] = [for 0..resbuffer.length: vec4f.W * 0.0001];
+  
+  auto surf = screen(settings.imgres, surface => true);
+  writeln "Calculate $(settings.imgres). ";
+  bool done; int parts-done;
+  (dw, dh) = settings.imgres;
+  int framenum;
+  void save(bool finalCall = false) {
+    if (settings.saveFrames && !finalCall) {
+      string framestr = "$framenum";
+      while (framestr.length < 5) framestr = "0$framestr";
+      saveAs(settings.file.between("", ".", =>reverse-search)~
+              ".$framestr."~
+              settings.file.between(".", "", =>reverse-search),
+              resbuffer);
+      framenum ++;
+    }
+    saveAs(settings.file, resbuffer, finalCall);
+  }
+  (auto up = new ThreadPool 1).addTask delegate void() {
+    auto start = sec();
+    while !done {
+      auto t = sec(), delta = float:(t - start);
+      if (parts-done) {
+        int num-parts = (dw * dh) / settings.xgroupsize;
+        writeln "$(int:delta)s: $(parts-done * 100 / num-parts)% done, est. $(int:(delta * num-parts / parts-done - delta))s left. ";
+      }
+      save();
+      sleep settings.savestep;
+    }
+  };
+  int len = settings.imgres.(_0 * _1) / settings.xgroupsize;
+  int[] randmap = [for i <- 0..len: i].eval[];
+  for int i <- 0..len swap randmap[i], randmap[i..$][rand()%$]; // fisher-yates shuffle
+  
+  auto desired-display-size = settings.imgres;
+  lp.runLoop(len, delegate void(int id, thr) {
+    set-handler (UnrecoverableError uerr) {
+      writeln "$(read-pretty-fcc-backtrace())\n$uerr. Aborting. ";
+      asm `int $3`;
+    }
+    (dw, dh) = desired-display-size;
+    render(thr, id/*randmap[id]*/, ray-res-vm-map, resbuffer);
+    parts-done ++;
+  });
+  done = true;
+  up.waitComplete;
+  writeln "Save. (processed $c__3, succeeded $c__ - registered $c__2)";
+  // writeln "testcount = $testcount";
+  save(true);
+}

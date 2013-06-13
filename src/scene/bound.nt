@@ -1,0 +1,64 @@
+module scene.bound;
+
+import scene.base;
+
+extern(C) bool fast_rayHitsAABB(vec3f* abp, p_ray, float* dist);
+
+struct AABB {
+  vec3f a, b;
+  void addInitialPoint(vec3f v) { 
+    a = v; b = v;
+  }
+  void addPoint(vec3f v) {
+    for int i <- 0..3 {
+      a[i] = min(a[i], v[i]);
+      b[i] = max(b[i], v[i]);
+    }
+  }
+  bool rayHits(vec3f* ray-p, (float, float)* dist = null) {
+    // return rayHitsAABB(&a, &b, pos-p, dir-p, dist);
+    float f;
+    auto res = fast_rayHitsAABB(&a, ray-p, &f);
+    if (dist) { *dist = (f, 1); }
+    return res;
+  }
+}
+
+class BoxBound : CommandHandler {
+  AABB aabb;
+  int skip;
+  bool aabbIsInited;
+  // TODO make sure we really only add one result
+  /*void init(CommandHandler[] sup) {
+    
+  }*/
+  void init(int skip) { this.skip = skip; }
+  void init(vec3f a, vec3f b, int skip) { addBox(a, b); this.skip = skip; }
+  override string toString() return "BoxBound\t$(aabb.a) -- $(aabb.b)";
+  void addBox(vec3f a, b) {
+    if (!aabbIsInited) {
+      aabbIsInited = true;
+      aabb.addInitialPoint a;
+      aabb.addPoint b;
+    } else {
+      aabb.addPoint a;
+      aabb.addPoint b;
+    }
+  }
+  void recordEffect(VMStats* stats) { }
+  void process(VMState[] list, int from, to) {
+    auto aabb = aabb, skip = skip;
+    if (!aabbIsInited) fail;
+    for int i <- from .. to {
+      ref sp = list[i];
+      
+      if (sp.handler !is CommandHandler:this) continue;
+      sp.stream = sp.stream[1..$];
+      
+      if (!aabb.rayHits(&rayplanes[sp.ray-id-1][i].pos)) {
+        sp.stream = sp.stream[skip..$];
+        using sp mixin(allocResult);
+      }
+    }
+  }
+}

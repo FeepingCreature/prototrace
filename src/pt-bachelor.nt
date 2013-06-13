@@ -21,7 +21,6 @@ shared int markovSteps, burnInLimit;
 shared float minBrightnessFactor;
 shared (int, int) dbgPos;
 
-
 import gd;
 Texture* readImage(string fname) {
   if (!fname.exists()) {
@@ -406,7 +405,7 @@ void main(string[] args) {
         while (rayqueue.length && !rayqueue[$-1].handler) rayqueue = rayqueue[0 .. $-1];
         while (base < rayqueue.length && !rayqueue[base].handler) base ++;
       } while (base < rayqueue.length) {
-        auto hdl = rayqueue[$-1].stream.ptr;
+        auto hdl = rayqueue[base].stream.ptr;
         // writeln "was: $(*hdl)";
         int start = base, end = rayqueue.length;
         /*for (int i = end - 1; i >= start; --i) {

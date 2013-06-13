@@ -1,0 +1,32 @@
+( = immediate true tbrfwd
+) = immediate brmrk
+X = 1 0 0 vec3f
+Y = 0 1 0 vec3f
+Z = 0 0 1 vec3f
+V0 = 0 0 0 vec3f
+0- = 0 swap -
+V1 = 1 1 1 vec3f
+true = 1 1 =
+false = 1 0 =
+dup = 0 pick
+over = 1 pick
+swap = 1 roll
+rot = 2 roll
+tuck = swap over
+not = false =
+dup2 = 1 pick 1 pick
+if = immediate not tbrfwd
+endif = immediate brmrk
+skyground = ( -- stream ) Y 0- Y 10 * plane V1 shine Y V0 plane 0.3 0.3 0.3 vec3f color group
+spherefield = skyground spheres group pathtrace render
+vdrop = v> drop
+loop = ( from to -- ) immediate swap 1 - swap v< v< pushbrmrk v> v> swap 1 + tuck over = rot rot v< v< tbrfwd
+end = ( -- ) immediate brback brmrk popbrmrk vdrop vdrop
+vdup = v> dup v< v<
+vdup> = vdup v>
+drops = swap drop
+drops3 = drops drops drops
+spheres = ( -- stream ) nothing -5 5 loop nothing vdup> -5 5 loop dup 0.5 vdup> 10 + vec3f 0.5 sphere 0.7 0.5 0.5 vec3f color rot swap group swap end drop vdup> 0.5 - 0 4.5 vec3f vdup> 0.5 + 1 14.5 vec3f bound group end
+snowflakehelper = 4 pick swap 4 pick * - 3 pick 0.5 * 3 pick 1 - snowflake group
+snowflakerecurse = X snowflakehelper X 0- snowflakehelper Y snowflakehelper Y 0- snowflakehelper Z snowflakehelper Z 0- snowflakehelper
+snowflake = dup 0 = not nothing swap if snowflakerecurse endif 3 pick 3 pick sphere group over 0 > if 3 pick 3 pick 2 * dup2 - rot rot + bound endif drops3

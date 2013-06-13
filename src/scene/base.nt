@@ -1,0 +1,30 @@
+module scene.base;
+
+public import base, vm;
+
+public import std.math;
+
+struct VMStats {
+  int results-needed-max, results-needed-cur;
+  int rays-needed-max, rays-needed-cur;
+  void addsResults(int num) { results-needed-cur += num; recordHighPoint; }
+  void addsRays(int num) { rays-needed-cur += num; recordHighPoint; }
+  void addsResult() addsResults 1;
+  void addsRay() addsRays 1;
+  void consumesResult() { results-needed-cur --; }
+  void consumesRay() { rays-needed-cur --; }
+  void recordHighPoint() {
+    if (rays-needed-cur > rays-needed-max) rays-needed-max = rays-needed-cur;
+    if (results-needed-cur > results-needed-max) results-needed-max = results-needed-cur;
+  }
+}
+
+interface CommandHandler {
+  void process(VMState[] list, int start, end);
+  void recordEffect(VMStats* stats);
+}
+
+abstract class SceneObject {
+  bool collide(Ray*, Result*) { assert(false, "$this::collide not implemented"); }
+  CommandHandler[] buildCommandStream() { assert(false, "$this::buildCommandStream not implemented"); }
+}

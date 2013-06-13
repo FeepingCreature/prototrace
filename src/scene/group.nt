@@ -2,12 +2,14 @@ module scene.group;
 
 import scene.base;
 
-class Group : SceneObject {
-  SceneObject[] list;
-  string toString() { return "Group<$(list.length)>"; }
-  bool collide(Ray* ray, Result* res) { assert(false); }
-  void process(VMState[] list, int start, end) {
-    if (!this.list.length) {
+class MergeTwo : CommandHandler {
+  bool empty;
+  void init(bool e = false) empty = e;
+  override void recordEffect(VMStats* stats) {
+    stats.consumesResult;
+  }
+  override void process(VMState[] list, int start, end) {
+    if (empty) {
       for int i <- start .. end {
         ref sp = list[i];
         if (sp.handler !is CommandHandler:this) continue;
@@ -37,14 +39,21 @@ class Group : SceneObject {
       sp.result-id --;
     }
   }
-  CommandHandler[] buildCommandStream(VMStats* stats) {
-    CommandHandler[auto~] res;
-    res ~= list[0].buildCommandStream(stats);
-    for auto obj <- list[1..$] {
-      res ~= obj.buildCommandStream(stats);
-      res ~= this;
-      stats.results-needed-cur --;
+}
+
+class Group : SceneObject {
+  SceneObject[] list;
+  string toString() { return "Group<$(list.length)>"; }
+  bool collide(Ray* ray, Result* res) { assert(false); }
+  override {
+    CommandHandler[] buildCommandStream() {
+      CommandHandler[auto~] res;
+      res ~= list[0].buildCommandStream();
+      for auto obj <- list[1..$] {
+        res ~= obj.buildCommandStream();
+        res ~= new MergeTwo (!this.list.length);
+      }
+      return res[];
     }
-    return res[];
   }
 }

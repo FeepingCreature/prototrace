@@ -1,0 +1,71 @@
+module cltest;
+
+import c.CL.cl;
+
+defmode CL "prefix CL_ prefix cl prefix cl_";
+pragma(lib, "OpenCL");
+
+void main() using mode CL {
+  void check(int thing) {
+    if (thing != SUCCESS) {
+      raise new Error "check failed: $thing";
+    }
+  }
+  void header(string s) { writeln "\n ==== $s ==== "; }
+  
+  template checked(alias A) {
+    template checked(T) {
+      template checked(U) {
+        T[] checked(U u) {
+          check A(u, 0, null, &int len);
+          auto res = new T[] len;
+          check A(u, len, res.ptr, null);
+          static if (types-equal(T, char)) {{
+            if (res.length && res[$-1] == 0)
+              res = res[0..$-1]; // remove trailing zero
+          }}
+          return res;
+        }
+      }
+    }
+  }
+  
+  auto platforms = checked!GetPlatformIDs!platform_id();
+  if (!platforms.length) {
+    writeln "No OpenCL platforms found";
+    return;
+  }
+  
+  header "platforms";
+  for auto plat <- platforms {
+    auto name    = checked!GetPlatformInfo!char(plat, PLATFORM_NAME);
+    auto profile = checked!GetPlatformInfo!char(plat, PLATFORM_PROFILE);
+    auto version = checked!GetPlatformInfo!char(plat, PLATFORM_VERSION);
+    auto vendor  = checked!GetPlatformInfo!char(plat, PLATFORM_VENDOR);
+    writeln "$plat: $name $version ($vendor, $profile)";
+  }
+  device_id chosen;
+  header "devices";
+  for auto plat <- platforms {
+    auto devs = checked!GetDeviceIDs!device_id(plat, DEVICE_TYPE_ALL);
+    for auto dev <- devs {
+      if (!chosen) chosen = dev;
+      auto name     = checked!GetDeviceInfo!char(dev, DEVICE_NAME);
+      auto profile  = checked!GetDeviceInfo!char(dev, DEVICE_PROFILE);
+      auto vendor   = checked!GetDeviceInfo!char(dev, DEVICE_VENDOR);
+      auto cl-version = checked!GetDeviceInfo!char(dev, DEVICE_VERSION);
+      auto driver-version = checked!GetDeviceInfo!char(dev, DRIVER_VERSION);
+      writeln "$plat:$dev: $name $driver-version ($vendor, $profile, $cl-version)";
+    }
+  }
+  if (!chosen) {
+    writeln "No OpenCL device found";
+    return;
+  }
+  header "startup";
+  auto context = CreateContext(null, 1, &chosen, null /* pfn_notify */, null, &int errcode_ret);
+  check errcode_ret;
+  auto queue = context.CreateCommandQueue(chosen, 0, &errcode_ret);
+  check errcode_ret;
+  
+}

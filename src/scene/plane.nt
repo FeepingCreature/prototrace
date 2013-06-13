@@ -153,7 +153,7 @@ static if (size-of VMState != 16 || size-of Result != 24*4 || size-of Ray != 8*4
 
 import std.hashmap;
 Hashmap!(void*, (cl_context context, cl_kernel kernel, cl_command_queue queue)) plane-cl-map;
-class Plane : SceneObject {
+class Plane : SceneObject, CommandHandler {
   vec3f normal, base;
   void init(vec3f n, b) {
     normal = n;
@@ -165,6 +165,7 @@ class Plane : SceneObject {
     plane-cl-map.insert(void*:this, cl);
     return cl;
   }
+  override string toString() return "Plane\t<$normal, $base>";
   bool collide(Ray* ray, Result* res) {
     float dist = -(normal * (ray.pos - base)).sum / (ray.dir * normal).sum;
     if (dist < 0) return false;
@@ -174,6 +175,8 @@ class Plane : SceneObject {
     return true;
   }
   void process(VMState[] list, int start, end) {
+    auto normal = normal, base = base; // local copies
+    auto cmp = CommandHandler:this;
     bool useOpenCL = false; // REALLY bad on nVidia.
     if useOpenCL using mode CL {
       auto cl = getCL();
@@ -227,7 +230,7 @@ class Plane : SceneObject {
     } else for int i <- start..end {
       ref sp = list[i];
       
-      if (sp.handler !is CommandHandler:this) continue;
+      if (sp.handler !is cmp) continue;
       sp.stream = sp.stream[1..$];
       
       ref ray = rayplanes[sp.ray-id-1][i];
@@ -246,8 +249,10 @@ class Plane : SceneObject {
       }
     }
   }
-  CommandHandler[] buildCommandStream(VMStats* stats) {
-    stats.needsResult;
+  override void recordEffect(VMStats* stats) {
+    stats.addsResult();
+  }
+  override CommandHandler[] buildCommandStream() {
     return CommandHandler[]:null ~ this;
   }
 }

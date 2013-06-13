@@ -1,0 +1,47 @@
+module scene.translate;
+
+import scene.base;
+
+extern(C) void fast_translate_process(Ray**, Result**, VMState*, int numstates, vec3f vector, void* self);
+
+class Translate : SceneObject {
+  vec3f vector;
+  SceneObject sup;
+  class PostTranslate : CommandHandler {
+    void process(VMState[] list) {
+      for int i <- 0 .. list.length {
+        auto sp = &list[i];
+        
+        if (void*:sp.handler == void*:CommandHandler:this)::
+        sp.stream = sp.stream[1..$];
+        
+        using sp mixin(freeRay.replace("!!", "1"));
+      }
+    }
+  }
+  void init(vec3f v, SceneObject so) (vector, sup) = (v, so);
+  bool collide(Ray* ray, Result* res) {
+    Ray ray2 = void;
+    ray2.pos = ray.pos - vector;
+    ray2.dir = ray.dir;
+    return sup.collide(&ray2, res);
+  }
+  void process(VMState[] list) {
+    for int i <- 0 .. list.length {
+      auto sp = &list[i];
+      
+      if (void*:sp.handler == void*:CommandHandler:this)::
+      sp.stream = sp.stream[1..$];
+      
+      auto ray = &rayplanes[sp.ray-id-1][i];
+      using sp mixin(allocRay);
+      rayplanes[sp.ray-id-1][i].(pos, dir) = ray.(pos - vector, dir);
+    }
+  }
+  CommandHandler[] buildCommandStream(VMStats* stats) {
+    stats.needsRay;
+    auto res = CommandHandler[]:null ~ this ~ sup.buildCommandStream(stats) ~ new PostTranslate;
+    stats.rays-needed-cur --;
+    return res;
+  }
+}

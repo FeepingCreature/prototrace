@@ -24,6 +24,7 @@ void init() {
   };
 }
 
+/*
 vec3f rand_sphere() {
   vec3f res;
   float magn;
@@ -32,6 +33,16 @@ vec3f rand_sphere() {
     magn = |res|;
   } while magn > 1 { }
   return res / magn;
+}*/
+
+// http://www.math.niu.edu/~rusin/known-math/96/sph.rand
+vec3f rand_sphere() {
+  float z = randf() * 2 - 1;
+  float t = randf() * PI2;
+  float r = sqrt(1 - z * z);
+  float x = r * cos t;
+  float y = r * sin t;
+  return vec3f(x, y, z);
 }
 
 (float, float) vary(float x, y, int spread) {
@@ -44,10 +55,11 @@ vec3f rand_sphere() {
   return (x+randf2(), y+randf2());
 }
 
+// average top result into second-from-top
 class AverageStep : CommandHandler {
-  int count;
-  int dst, src; // average src into dst
-  void init(int c, dst, src) { this.(count, dst, src) = (c, dst, src); }
+  int count, skip;
+  void init(int c, s = 0) { this.count = c; this.skip = s; }
+  override void recordEffect(VMStats* stats) { }
   void process(VMState[] list, int start, end) {
     float factor = 1f / count;
     for int i <- start .. end {
@@ -56,17 +68,18 @@ class AverageStep : CommandHandler {
       if (void*:sp.handler == void*:CommandHandler:this)::
       sp.stream = sp.stream[1..$];
       
-      auto res1 = &resplanes[dst][i], res2 = &resplanes[src][i];
+      ref dst = resplanes[sp.result-id-1 - skip][i], src = resplanes[sp.result-id-1][i];
       vec3f sum = vec3f(0);
-      if (res1.success) sum = res1.emissive-color;
-      if (res2.success) sum += res2.emissive-color * factor;
-      res1.success |= res2.success;
-      res1.emissive-color = sum;
+      if (dst.success) sum = dst.emissive-color;
+      if (src.success) sum += src.emissive-color * factor;
+      dst.success |= src.success;
+      dst.emissive-color = sum;
     }
   }
 }
 
 class AllocEmptyResult : CommandHandler {
+  override void recordEffect(VMStats* stats) { stats.addsResult; }
   void process(VMState[] list, int start, end) {
     for int i <- start .. end {
       auto sp = &list[i];
@@ -75,12 +88,15 @@ class AllocEmptyResult : CommandHandler {
       sp.stream = sp.stream[1..$];
       
       using sp mixin(allocResult);
-      resplanes[sp.result-id-1][i].success = false;
+      ref res = resplanes[sp.result-id-1][i];
+      res.success = false;
+      res.data = 0;
     }
   }
 }
 
 class FreeResult : CommandHandler {
+  override void recordEffect(VMStats* stats) { stats.consumesResult; }
   void process(VMState[] list, int start, end) {
     for int i <- start .. end {
       auto sp = &list[i];
@@ -97,13 +113,10 @@ class AverageResults : SceneObject {
   SceneObject sup;
   int count;
   void init(int count, SceneObject sup) this.(sup, count) = (sup, count);
-  CommandHandler[] buildCommandStream(VMStats* stats) {
-    int base-id = stats.results-needed-cur;
-    stats.needsResult;
-    auto stream = sup.buildCommandStream(stats);
-    stats.results-needed-cur --;
+  CommandHandler[] buildCommandStream() {
+    auto stream = sup.buildCommandStream();
     
-    auto as = new AverageStep (count, base-id, base-id + 1);
+    auto as = new AverageStep (count);
     auto fr = new FreeResult;
     
     CommandHandler[auto~] res;
@@ -118,6 +131,7 @@ class AverageResults : SceneObject {
 }
 
 class FreeRay : CommandHandler {
+  override void recordEffect(VMStats* stats) { stats.consumesRay; }
   void process(VMState[] list, int start, end) {
     for int i <- start .. end {
       auto sp = &list[i];
@@ -134,6 +148,9 @@ class CopyRay : CommandHandler {
   int from;
   void init() { from = -1; }
   void init(int f) from = f;
+  override void recordEffect(VMStats* stats) {
+    stats.addsRay;
+  }
   void process(VMState[] list, int start, end) {
     // TODO: memcpy runs
     for int i <- start .. end {
@@ -152,50 +169,94 @@ class CopyRay : CommandHandler {
   }
 }
 
-class SkipAhead : CommandHandler {
-  int skipdist; void init(int i) skipdist = i;
-  void process(VMState[] list, int start, end) {
-    for int i <- start .. end {
-      auto sp = &list[i];
+class JumpIfData : CommandHandler {
+  int compare, skip, depth; void init(int c, d, s) (compare, depth, skip) = (c, d, s);
+  override void recordEffect(VMStats* stats) { }
+  override void process(VMState[] list, int from, to) {
+    for int i <- from .. to {
+      ref sp = list[i];
       
-      if (void*:sp.handler == void*:CommandHandler:this)::
+      if (sp.handler !is CommandHandler:this) continue;
       sp.stream = sp.stream[1..$];
       
-      sp.stream = sp.stream[skipdist .. $];
+      ref res = resplanes[sp.result-id-1 - depth][i];
+      if (res.data == compare) sp.stream = sp.stream[skip .. $];
     }
   }
 }
 
-/*
-class IfState : CommandHandler {
-  int compare, skip; void init(int c, s) (compare, skip) = (c, s);
-  void process(VMState[] list) {
-    for int i <- 0 .. list.length {
-      auto sp = &list[i];
+class AddData : CommandHandler {
+  int depth, value;
+  void init(int d, v) (depth, value) = (d, v);
+  override void recordEffect(VMStats* stats) { }
+  override void process(VMState[] list, int from, to) {
+    for int i <- from .. to {
+      ref sp = list[i];
       
-      if (void*:sp.handler == void*:CommandHandler:this)::
+      if (sp.handler !is CommandHandler:this) continue;
       sp.stream = sp.stream[1..$];
       
-      if (sp.state != compare) sp.stream = sp.stream[skip .. $];
+      ref res = resplanes[sp.result-id-1 - depth][i];
+      res.data += value;
     }
   }
 }
 
-CommandHandler[] mkIfElse(int compare, CommandHandler[] case1, case2) {
+class Jump : CommandHandler {
+  int offset, start;
+  void init() { start = -1; offset = -1; }
+  void to(int i) { if (start != -1) fail; start = i; }
+  // must be right before the jump
+  void from(int target) { if (start == -1) fail; offset = start - target; }
+  override void recordEffect(VMStats* stats) { }
+  override void process(VMState[] list, int from, to) {
+    if (offset == -1) fail;
+    for int i <- from .. to {
+      ref sp = list[i];
+      
+      if (sp.handler !is CommandHandler:this) continue;
+      sp.stream = sp.stream[offset..$];
+    }
+  }
+}
+
+CommandHandler[] repeat(int depth, int count, CommandHandler[] delegate() dg) {
   CommandHandler[auto~] res;
-  case1 ~= new SkipAhead(case2.length);
-  res ~= new IfState(compare, case1.length);
-  res ~= case1;
-  res ~= case2;
+  auto jmp = new Jump;
+  auto sub = dg();
+  
+  jmp.to(res.length);
+  res ~= new JumpIfData(d => depth, count, sub.length + 2);
+  res ~= sub;
+  res ~= new AddData(d => depth, 1); // plus one ..
+  jmp.from(res.length);
+  res ~= jmp; // plus two.
   return res[];
 }
-*/
+
+class SwapAndDiscardRes : CommandHandler {
+  override void recordEffect(VMStats* stats) { stats.consumesResult; }
+  override void process(VMState[] list, int from, to) {
+    for int i <- from .. to {
+      ref sp = list[i];
+      
+      if (sp.handler !is CommandHandler:this) continue;
+      sp.stream = sp.stream[1 .. $];
+      
+      ref res1 = resplanes[sp.result-id-1][i];
+      ref res2 = resplanes[sp.result-id-2][i];
+      res2 = res1;
+      using sp mixin freeResult.replace(`!!`, `1`);
+    }
+  }
+}
 
 extern(C) {
   void ray_to_coordsf(int dw, dh, Ray* rayp, float* xp, yp);
   void coordsf_to_ray(int dw, dh, float x, y, Ray* rayp);
 }
 
+/*
 class RandomizeRay : CommandHandler {
   int src;
   void init(int src = -1) { this.src = src; }
@@ -226,6 +287,7 @@ class RandomizeRay : CommandHandler {
     }
   }
 }
+*/
 
 void delegate(Ray* rayp, vec3f col, bool isBack, float factor, bool isMetroHit) recordResultDg;
 
@@ -240,6 +302,7 @@ void recordState(VMState* sp, int i, int skipRays, skipResults, vec3f v, bool is
 class RecordResultStep : CommandHandler {
   int skipRays, skipResults;
   void init(int skRay = 0, skRes = 0) (skipRays, skipResults) = (skRay, skRes);
+  override void recordEffect(VMStats* stats) { }
   void process(VMState[] list, int start, end) {
     for int i <- start .. end {
       auto sp = &list[i];

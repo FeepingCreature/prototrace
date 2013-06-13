@@ -1,0 +1,455 @@
+module pt;
+
+import std.(file, process, getopt, string, boehm, util);
+import sdl, c.fenv;
+
+import render;
+
+import scene.(base, group, plane, color, lighting, metro, util, texture, sphere, bound);
+
+void configureStream(CommandHandler[] stream) {
+  VMStats stats;
+  stats.addsRay;
+  for auto thing <- stream thing.recordEffect(&stats);
+  stream ~= CommandHandler: null; // terminator
+  vm.fullStream = stream;
+  settings.rays-needed = stats.rays-needed-max;
+  settings.results-needed = stats.results-needed-max;
+  writeln "(ray, res): ($(settings.rays-needed), $(settings.results-needed)): $(stream[0..$-1].length)";
+  writeln "steps: $(stream.length - 1)";
+  if (stream.length > 21) writeln "Last 20: $(stream[$-21..$-1])";
+  else writeln "Stream: $(stream[0..$-1])";
+}
+
+class UnforthError : Error {
+  string ufmsg;
+  void init(string msg) { super.init("UnforthError: $msg"); this.ufmsg = msg; }
+}
+
+extern(C) { void GC_disable(); void GC_gcollect(); void GC_enable(); }
+void main(string[] args) {
+  set-handler (Error err) { writeln "$(read-pretty-fcc-backtrace())\n$err. Aborting. "; invoke-exit "exit"; }
+  define-exit "exit" exit(1);
+  
+  break-on-float-errors = true;
+  // bool break-on-float-errors = false;
+  fov = 0.75;
+  using new Options using settings {
+    addLong("average",     "a", λ average = true; );
+    addLong("minbrightnessfactor", "b", λ(string s) minBrightnessFactor = atof s; );
+    addLong("depth",       "d", λ(string s) depth = atoi s; );
+    addLong("savestep",    "e", λ(string s) savestep = atof s; );
+    addLong("fps",         "f", λ(string s) desired-fps = std.string.atof s; );
+    addLong("groupsize",   "g", λ(string s) groupsize = atoi s;);
+    addLong("help",        "h", λ{ printHelp; exit 0; });
+    addLong("input",       "i", λ(string s) input = s;);
+    addLong("keepgoing",   "k", λ break-on-float-errors = false; );
+    addLong("burninlimit", "l", λ(string s) burnInLimit = atoi s; );
+    addLong("markovsteps", "m", λ(string s) markovSteps = atoi s; );
+    addLong("boehm",       "n", λ useBoehm = true; );
+    addLong("output",      "o", λ(string s) file = s; );
+    addLong("res",         "r", λ(string s) using s.split "x" imgres = (atoi that[0], atoi that[1]); );
+    addLong("samples",     "s", λ(string s) samples = atoi s; );
+    addLong("threads",     "t", λ(string s) threads = atoi s; );
+    addLong("fov",         "v", λ(string s) fov = atof s; );
+    addLong("noLensmut",   "x", λ allowLensmut = false; );
+    addLong("saveframes",  "y", λ saveFrames = true; );
+    addLong("stepsize",    "z", λ(string s) stepsize = atoi s; );
+    args = process args;
+  }
+  if (settings.useBoehm)
+    initBoehm (debugMode => true);
+  
+  onResize = delegate void(int w, int h) {
+    screen(w, h, flags => SDL_OPENGL | SDL_RESIZABLE | SDL_ANYFORMAT);
+  };
+  
+  SceneObject scene;
+  
+  if (break-on-float-errors)
+    for auto val <- [FE_DIVBYZERO, FE_INVALID/*, FE_OVERFLOW I said infs are fine >_>*/]
+      feenableexcept val;
+  
+  if (settings.input || true) {
+    import std.wren, std.hashmap;
+    
+    ref datastack = new (Thing[auto~], ()) #._0;
+    ref vstack = new (Thing[auto~], ()) #._0; // variable stack.
+    ref dict = *new Hashmap!(string, void delegate());
+    ref macros = *new Hashmap!(string, string[]);
+    ref userdefs = new ((string, string)[auto~], ()) #._0;
+    
+    void delegate(string[], bool repl = false, bool verbose = false) execute; // predeclare
+    
+    string[] splitme(string s) {
+      string[auto~] res;
+      for auto word <- s.split " " if word.length res ~= word;
+      return res[];
+    }
+    
+    void define(string name, value) {
+      for ref (key, v) <- userdefs
+        if key == name { key = null; break; }
+      // optimize "replaced last definition" case
+      while (userdefs.length && !userdefs[$-1][0]) userdefs.popEnd;
+      userdefs ~= (name, value); // append at the end!
+      // writeln "$name = $(value.split \" \")";
+      auto vsplitted = splitme value;
+      if (auto rest = value.startsWith "immediate ") macros.insert(name, rest.split " ");
+      else dict.insert(name, new λ{ execute vsplitted; });
+    }
+    
+    void tpush(Thing t) { datastack ~= t; }
+    void vtpush(Thing t) { vstack ~= t; }
+    Thing tpop() {
+      if (!datastack.length) raise new UnforthError "stack underflow";
+      return datastack.popEnd();
+    }
+    Thing vtpop() {
+      if (!vstack.length) raise new UnforthError "vstack underflow";
+      return vstack.popEnd();
+    }
+    template  push(T) { void push (T t) {  tpush neat-to-wren t; } }
+    template vpush(T) { void vpush(T t) { vtpush neat-to-wren t; } }
+    template   pop(T) { T pop() { return wren-to-neat!T  tpop();  } }
+    template  vpop(T) { T pop() { return wren-to-neat!T vtpop(); } }
+    alias popStream = *&pop!CommandHandler[];
+    Hashmap!((string*, int), string[auto~]) unrollCache;
+    execute = λ(string[] words, bool repl = false, bool verbose = false) {
+      int[auto~] jstack; // jump stack
+      
+      string[auto~] seq;
+      if (repl && words.length > 1 && words[1] == "=") {
+        define(words[0], words[2..$].join " ");
+        if (verbose) writeln "$(words[0]) defined.";
+        return;
+      }
+      if (repl && words.length == 2 && words[0] == "?") {
+        for string (key, value) <- userdefs if key == words[1] {
+          writeln "$key = $value";
+          return;
+        }
+        raise new UnforthError "word not found '$(words[1])'";
+      }
+      void unroll(string[] args) {
+        for auto word <- args {
+          auto macrop = macros.get(word);
+          if (macrop) unroll *macrop;
+          else seq ~= word;
+        }
+      }
+      
+      if (auto p = unrollCache.get(words.(ptr, length))) {
+        seq = *p;
+      } else {
+        unroll words[];
+        unrollCache.insert(words.(ptr, length), seq);
+      }
+      
+      int ip = 0;
+      alias endReached = ip == seq.length;
+      alias word = seq[ip];
+      while (ip < seq.length) {
+        // writeln "> $word at $(datastack) $(jstack)";
+        
+        // TODO do thing that is not horrible hack
+        scope parts = word.split(".");
+        if (parts.length == 2) {
+          int (a, b) = parts.(atoi _0, atoi _1);
+          if ("$a" == parts[0] && "$b" == parts[1]) {
+            push!float (a + b * 1f / ipow(10, parts[1].length));
+            ip ++;
+            continue;
+          }
+        }
+        int i = atoi word;
+        if (word == "$i") {
+          push i;
+          ip ++;
+          continue;
+        }
+        // test, branch forward
+        alias tbrfwd = "tbrfwd", brmrk = "brmrk";
+        // push branch marker, branch back
+        alias pushbrmrk = "pushbrmrk", popbrmrk = "popbrmrk", brback = "brback";
+        if (word == tbrfwd) {
+          auto test = pop!bool();
+          int depth = 1;
+          ip ++;
+          if (test) {
+            while (depth > 0) { // branch marker
+              if (endReached) raise new UnforthError "structural: failed to find closing branch marker";
+              if (word == tbrfwd) depth ++;
+              else if (word == brmrk) depth --;
+              ip ++;
+            }
+          }
+          continue;
+        }
+        if (word == brmrk) { // noop in regular operation
+          ip ++;
+          continue;
+        }
+        if (word == pushbrmrk) {
+          ip ++;
+          jstack ~= ip;
+          continue;
+        }
+        if (word == brback || word == popbrmrk) {
+          if (!jstack.length)
+            raise new UnforthError "structural: branched backwards but no jump marker found";
+        }
+        if (word == brback) {
+          ip = jstack[$-1];
+          continue;
+        }
+        if (word == popbrmrk) {
+          jstack.popEnd();
+          ip ++;
+          continue;
+        }
+        auto meaningp = dict.get(word);
+        if (!meaningp) {
+          writeln "Unknown word '$word'";
+          exit(1);
+        }
+        *meaningp #();
+        ip ++;
+      }
+      if (jstack.length)
+        raise new UnforthError "structural: jumpmark left at end of sequence";
+    }
+    void save(string filename) {
+      char[auto~] file;
+      for string (key, value) <- userdefs if key {
+        file ~= "$key = $value\n";
+      }
+      filename.writeAll(ubyte[]: file[]);
+    }
+    void load(string filename) {
+      int count;
+      for auto line <- (string:filename.readAll()).split "\n" {
+        execute (splitme line, => repl); // treat input as like from repl.
+        count ++;
+      }
+      writeln "$count definition(s) loaded.";
+    }
+    void stackdump() {
+      void dumpReverse(Thing[] stack) {
+        for (int i = stack.length - 1; i >= 0; --i) {
+          auto thing = stack[i];
+          if (auto at = Array!CommandHandler: thing) {
+            writeln $ " ["~[for thing <- at.value: "$thing"].join(",")~"]";
+          }
+          else if (is-nil thing) writeln " false";
+          else if (is-t thing) writeln " true";
+          else writeln " $thing";
+        }
+      }
+      if (vstack.length) writeln "--vstack tip--";
+      dumpReverse vstack[];
+      if (datastack.length) writeln "--stack tip--";
+      dumpReverse datastack[];
+    }
+    
+    template ophandle(alias Op) {
+      void ophandle() {
+        auto tb = tpop(), ta = tpop();
+        bool bia = !! auto ia = Integer:ta;
+        bool bib = !! auto ib = Integer:tb;
+        bool bfa = !! auto fa = Number:ta;
+        bool bfb = !! auto fb = Number:tb;
+        bool bv3fa = !! auto a3f = Vec3f:ta;
+        bool bv3fb = !! auto b3f = Vec3f:tb;
+        
+        if bia && bib {
+          int a = ia.num, b = ib.num;
+          static if (Op == "/") {{
+            if ((a / b) * b == a) push!int(a/b);
+            else push!float(a * 1f / b);
+          }} else {{
+            mixin("push!int(ia.num "~Op~" ib.num); ");
+          }}
+        } else if (bia && bfb) {
+          mixin("push!float(ia.num "~Op~" fb.num); ");
+        } else if (bfa && bib) {
+          mixin("push!float(fa.num "~Op~" ib.num); ");
+        } else if (bfa && bfb) {
+          mixin("push!float(fa.num "~Op~" fb.num); ");
+        } else if (bv3fa && bv3fb) {
+          mixin("push!vec3f(a3f.value "~Op~" b3f.value); ");
+        } else if (bv3fa && (bib || bfb)) {
+          if (bib) mixin("push!vec3f(a3f.value "~Op~" ib.num); ");
+          else mixin("push!vec3f(a3f.value "~Op~" fb.num); ");
+        } else if (bv3fb && (bia || bfa)) {
+          if (bia) mixin("push!vec3f(ia.num "~Op~" b3f.value); ");
+          else mixin("push!vec3f(fa.num "~Op~" b3f.value); ");
+        } else raise new UnforthError "Cannot compute: '$ta' '$Op' '$tb'";
+      }
+    }
+    dict.insert("+", new &ophandle!"+");
+    dict.insert("-", new &ophandle!"-");
+    dict.insert("*", new &ophandle!"*");
+    dict.insert("/", new &ophandle!"/");
+    template cmphandle(alias Cmp) {
+      void cmphandle() {
+        auto tb = tpop(), ta = tpop();
+        bool bia = !! auto ia = Integer:ta, bib = !! auto ib = Integer:tb;
+        bool bfa = !! auto fa = Number :ta, bfb = !! auto fb = Number :tb;
+        bool ba = is-nil ta || is-t ta;
+        bool bb = is-nil tb || is-t tb;
+        if (bia && bib) mixin("push(ia.num "~Cmp~" ib.num); ");
+        else if (bia && bfb) mixin("push(ia.num "~Cmp~" fb.num); ");
+        else if (bfa && bib) mixin("push(fa.num "~Cmp~" ib.num); ");
+        else if (bfa && bfb) mixin("push(fa.num "~Cmp~" fb.num); ");
+        else if (ba && bb && (Cmp == "==" || Cmp == "!="))
+          mixin("push(is-t ta "~Cmp~" is-t tb); ");
+        else raise new UnforthError "Cannot compare: '$ta' '$Cmp' '$tb'";
+      }
+    }
+    dict.insert("<", new &cmphandle!"<");
+    dict.insert(">", new &cmphandle!">");
+    dict.insert("=", new &cmphandle!"==");
+    dict.insert("<=", new &cmphandle!"<=");
+    dict.insert(">=", new &cmphandle!">=");
+    dict.insert("v<", new λ{ vtpush tpop(); });
+    dict.insert("v>", new λ{ tpush vtpop(); });
+    dict.insert("vec3f", new λ{
+      auto fz = pop!float(), fy = pop!float(), fx = pop!float();
+      push vec3f(fx, fy, fz);
+    });
+    dict.insert("drop", new λ{ tpop(); });
+    dict.insert("pick", new λ{
+      auto depth = pop!int();
+      if (depth >= datastack.length) raise new UnforthError "stack underflow in $depth pick";
+      push(datastack[$-1 - depth]);
+    });
+    dict.insert("roll", new λ{
+      auto depth = pop!int();
+      if (depth >= datastack.length) raise new UnforthError "stack underflow in $depth roll";
+      auto thing = datastack[$-1 - depth];
+      for (int i = depth; i >= 1; --i)
+        datastack[$-1 - i] = datastack[$-1 - i + 1];
+      datastack[$-1] = thing;
+    });
+    dict.insert("nothing", new λ{
+      push CommandHandler[]:null;
+    });
+    dict.insert("plane", new λ{
+      auto base = pop!vec3f(), normal = pop!vec3f();
+      auto pl = new Plane(normal, base);
+      push pl.buildCommandStream();
+    });
+    dict.insert("sphere", new λ{
+      auto radius = pop!float(), center = pop!vec3f();
+      auto sp = new Sphere(center, radius);
+      push sp.buildCommandStream();
+    });
+    dict.insert("shine", new λ{
+      auto color = pop!vec3f();
+      push $ popStream()~new Shine(color, null);
+    });
+    dict.insert("color", new λ{
+      auto color = pop!vec3f();
+      push $ popStream()~new Color(color, null);
+    });
+    dict.insert("group", new λ{
+      auto sb = popStream(), sa = popStream();
+      if (!sa && !sb) push CommandHandler[]:null;
+      else if (sa && !sb) push sa;
+      else if (sb && !sa) push sb;
+      else push $ sa~sb~new MergeTwo;
+    });
+    dict.insert("bound", new λ{
+      auto b = pop!vec3f(), a = pop!vec3f(), str = popStream();
+      push $ CommandHandler[]:null ~ new BoxBound(a, b, str.length) ~ str;
+    });
+    
+    dict.insert("pathtrace", new λ{
+      auto stream = popStream;
+      push mkPathTraceLighting(stream, null, settings.samples, settings.depth);
+    });
+    dict.insert("dumpstream", new λ{
+      auto stream = popStream;
+      writeln " -- stream --";
+      for auto thing <- stream
+        writeln "   $thing";
+      writeln "$(stream.length) total";
+    });
+    dict.insert("render", new λ{
+      auto stream = popStream;
+      configureStream stream;
+      stackdump;
+      writeln "--render--";
+      if (settings.imgres.(_0 && _1))
+        renderSceneToFile stream;
+      else
+        renderSceneToScreenDynamic stream;
+    });
+    
+    import std.lib.libedit;
+    setPrompt("pt> ");
+    if (exists "defs.uf") load "defs.uf";
+    
+    if (settings.input) {
+      execute splitme settings.input;
+      return;
+    }
+    
+    // auto input = reader();
+    // onExit input.close;
+    
+    string lastline;
+    // for auto line <- input {
+    while (true) {
+      printf("pt> ");
+      auto line = readln();
+      line = line.dup; // lol memory
+      if (line[0] == "^") line = lastline ~ line[1..$];
+      // input.addHistory line;
+      set-handler (UnforthError ue) {
+        writeln "! $(ue.ufmsg)";
+        stackdump;
+        invoke-exit "continue";
+      }
+      set-handler (WrenError we) {
+        writeln "? $we";
+        invoke-exit "continue";
+      }
+      define-exit "continue" continue;
+      // reset
+      datastack = null;
+      vstack = null;
+      execute (splitme line, => repl, =>verbose);
+      save "defs.uf";
+      stackdump;
+      line = lastline;
+    }
+    return;
+  } else {
+    using new Group {
+      list ~= new Plane(vec3f(0, 1, 0), vec3f(0, 0, 0));
+      list ~= new Shine(vec3f(1), new Plane(vec3f(0, -1, 0), vec3f(0, 10, 0)));
+      list ~= new Color(vec3f(1, 0.7, 0.7), new Plane(vec3f(1, 0, 0), vec3f(-8, 0, 0)));
+      scene = that;
+    }
+    // if (jitter) {
+      // scene = new AverageResults(samples, new JitterRay(&getScale, new PathTraceLighting(scene, new PathTraceLighting (scene, new PathTraceLighting scene))));
+    // } else {
+      // scene = new PathTraceLighting(samples, scene, new PathTraceLighting (scene, new PathTraceLighting scene));
+    // }
+    // scene = new PathTraceLighting(samples, scene, new PathTraceLighting(scene));
+    // scene = new PlainLighting(scene);
+    scene = new PathTraceLighting(settings.samples, scene, settings.depth);
+    // scene = new MetropolisLighting(scene, depth, samples);
+  }
+  
+  auto stream = scene.buildCommandStream();
+  configureStream stream;
+  
+  if (settings.imgres.(_0 && _1)) {
+    renderSceneToFile stream;
+    return;
+  }
+  renderSceneToScreenDynamic stream;
+}

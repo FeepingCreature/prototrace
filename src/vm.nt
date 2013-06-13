@@ -4,11 +4,22 @@ import base;
 
 Ray[] all_rayplanes;
 int rayplane_size;
-alias rayplanes = [for i <- ints: all_rayplanes[rayplane_size * i .. rayplane_size * (i + 1)]];
+// JUST an optimization to avoid a multiply! MUST be sequential in all_rayplanes!
+Ray[][] rayplanes;
 
 Result[] all_resplanes;
 int resplane_size;
-alias resplanes = [for i <- ints: all_resplanes[resplane_size * i .. resplane_size * (i + 1)]];
+// Likewise!
+Result[][] resplanes;
+
+void initPlaneMaps() {
+  alias rayiter = [for i <- 0..all_rayplanes.length / rayplane_size:
+    all_rayplanes[rayplane_size * i .. rayplane_size * (i + 1)]];
+  alias resiter = [for i <- 0..all_resplanes.length / resplane_size:
+    all_resplanes[resplane_size * i .. resplane_size * (i + 1)]];
+  rayplanes = rayiter.eval[];
+  resplanes = resiter.eval[];
+}
 
 shared CommandHandler[] fullStream; // used for OpenCL
 
@@ -40,7 +51,6 @@ import std.math;
 vec3f evaluateRay(VMState* sp, int i, int firstRay, firstRes, end = 0, bool* isBack = null) {
   // auto rays = sp.rays[firstRay .. $ - end], hits = sp.results[firstRes .. $ - end];
   int numRays = (sp.ray-id - end) - firstRay, numHits = (sp.result-id - end) - firstRes;
-  vec3f res = vec3f(0);
   if (numRays != numHits) {
     writeln "Mismatched call for evaluateRay: $numRays and $numHits";
     asm `int $3`;
@@ -49,9 +59,13 @@ vec3f evaluateRay(VMState* sp, int i, int firstRay, firstRes, end = 0, bool* isB
   if (numHits != 1) {
     assert(false, "got $numHits hits .. what");
   }
+  ref res = resplanes[firstRes][i];
+  if (!res.success) return vec3f(0);
   return resplanes[firstRes][i].emissive-color;
   
-  /*int start = 0;
+  /*
+  vec3f res = vec3f(0);
+  int start = 0;
   while (start < numHits && (resplanes[firstRes+start][i]).(success && reflective-color != vec3f(0))) {
     start ++;
   }

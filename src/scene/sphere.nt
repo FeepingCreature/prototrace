@@ -1,0 +1,85 @@
+module scene.sphere;
+
+import scene.base, c.math;
+
+// shared long testcount;
+
+class Sphere : SceneObject, CommandHandler {
+  vec3f center;
+  float radius, rsq;
+  void init(vec3f c, float r) { center = c; radius = r; rsq = radius * radius; }
+  string toString() return "Sphere\t<$center, $radius>";
+  bool collide(Ray* ray, Result* res) {
+    vec3f pos = ray.pos - center; // pretranslate so we can pretend that we're a sphere around the origin
+    vec3f dir = ray.dir;
+    float p = lvize(vec3f(2) * pos * dir).sum;
+    
+    float inside = (p*p/4 + rsq) - lvize(pos*pos).sum;
+    if (inside < 0) return false;
+    
+    float sq = sqrtf inside,
+      k = -p/2,
+      k1 = k + sq,
+      k2 = k - sq;
+    if (k1 < 0) return false;
+    res.distance = [k1, k2][k2 > 0];
+    res.col = vec3f(1);
+    {
+      vec3f normal = ray.(pos + dir * res.distance) - center;
+      res.normal = normal / vec3f(|normal|);
+    }
+    return true;
+  }
+  override void process(VMState[] list, int start, end) {
+    auto rsq = rsq, center = center, invr = 1f / radius;
+    // int tc;
+    // onExit testcount += tc;
+    for int i <- start .. end {
+      ref sp = list[i];
+      
+      if (sp.handler !is CommandHandler:this) continue;
+      sp.stream = sp.stream[1..$];
+      
+      // tc ++;
+      
+      using sp mixin(allocResult);
+      vec3f (pos, dir) = rayplanes[sp.ray-id-1][i].(pos, dir);
+      pos -= center; // pretranslate so we can pretend that we're a sphere around the origin
+      
+      ref res = resplanes[sp.result-id-1][i];
+      
+      // algorithm 1
+      /*float k = -(dir * pos).sum / (dir*dir).sum;
+      auto p = pos + dir * k, ps = (p*p).sum;
+      if (ps > rsq) continue;
+      
+      auto sq = sqrtf (rsq - ps);
+      auto k1 = k + sq, k2 = k - sq;*/
+      
+      // algorithm 2
+      float p = (2 * pos * dir).sum;
+      
+      float inside = (p*p/4 + rsq) - (pos*pos).sum;
+      if (inside < 0) continue;
+      float sq = sqrt inside,
+        k = -p/2,
+        k1 = k + sq,
+        k2 = k - sq;
+      
+      // common
+      if (k1 >= 0) using res {
+        claim;
+        
+        distance = [k1, k2][k2 > 0];
+        vec3f normal = pos + dir * distance; // sphere around the origin, remember
+        that.normal = normal * invr;
+      }
+    }
+  }
+  override void recordEffect(VMStats* stats) {
+    stats.addsResult();
+  }
+  CommandHandler[] buildCommandStream() {
+    return CommandHandler[]: null ~ this;
+  }
+}

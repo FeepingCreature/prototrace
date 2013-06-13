@@ -7,7 +7,11 @@ class LightStep : CommandHandler {
   int numBasicSteps;
   void init(vec3f* lp, int n) { lightpos = lp; numBasicSteps = n; }
   class LightMergeStep : CommandHandler {
-    void process(VMState[] list, int start, end) {
+    override void recordEffect(VMStats* stats) {
+      stats.consumesRay;
+      stats.consumesResult;
+    }
+    override void process(VMState[] list, int start, end) {
       for int i <- start .. end {
         auto sp = &list[i];
         
@@ -40,7 +44,10 @@ class LightStep : CommandHandler {
     }
   }
   LightMergeStep mkMergeStep() { return new LightMergeStep; }
-  void process(VMState[] list, int start, end) {
+  override void recordEffect(VMStats* stats) {
+    stats.addsRay;
+  }
+  override void process(VMState[] list, int start, end) {
     for int i <- start .. end {
       auto sp = &list[i];
       
@@ -85,9 +92,10 @@ class PathTraceStep : CommandHandler {
     skip-start = at;
   }
   class PathTraceMergeStep : CommandHandler {
-    void process(VMState[] list, int start, end) {
+    override void recordEffect(VMStats* stats) { }
+    override void process(VMState[] list, int start, end) {
       for int i <- start .. end {
-        auto sp = &list[i];
+        ref  sp = list[i];
         
         if (sp.handler !is CommandHandler:this) continue;
         sp.stream = sp.stream[1..$];
@@ -101,7 +109,6 @@ class PathTraceStep : CommandHandler {
             // res.emissive-color += vec3f(1, 0, 0);
           }
         }
-        // using sp mixin(freeResult.replace("!!", "1"));
       }
     }
   }
@@ -114,11 +121,15 @@ class PathTraceStep : CommandHandler {
     assert(skip != -1);
     return new PathTraceMergeStep;
   }
-  void process(VMState[] list, int start, end) {
+  override void recordEffect(VMStats* stats) {
+    stats.addsRay;
+  }
+  override void process(VMState[] list, int start, end) {
+    auto self = CommandHandler:this;
     for int i <- start .. end {
-      auto sp = &list[i];
+      ref sp = list[i];
       
-      if (sp.handler !is CommandHandler:this) continue;
+      if (sp.handler !is self) continue;
       sp.stream = sp.stream[1..$];
       
       using sp mixin(allocRay);
@@ -144,15 +155,87 @@ class LightSource : SceneObject {
   SceneObject sup;
   vec3f* ls;
   void init(vec3f* ls, SceneObject sup) this.(ls, sup) = (ls, sup);
-  CommandHandler[] buildCommandStream(VMStats* stats) {
-    stats.needsResult;
-    stats.needsRay;
-    auto stream = sup.buildCommandStream(stats);
-    stats.results-needed-cur --;
-    stats.rays-needed-cur --;
+  CommandHandler[] buildCommandStream() {
+    auto stream = sup.buildCommandStream();
     using new LightStep(ls, stream.length)
       return stream ~ that ~ stream ~ mkMergeStep();
   }
+}
+
+template memo(T) {
+  auto memo(T t) {
+    alias PT = ParamTypes T, RT = ReturnType T;
+    import std.hashmap;
+    Hashmap!(PT, RT) map;
+    return new λ(PT pt) {
+      if (auto p = map.get(&pt)) return *p;
+      auto res = t pt;
+      map.insert(&pt, &res);
+      return res;
+    }
+  }
+}
+
+CommandHandler[] mkPathTraceLighting(CommandHandler[] first, rest, int samples, depth) {
+  if (!rest) rest = first;
+  CommandHandler[auto~] res;
+  
+  res ~= first; // results ++
+  CommandHandler[] buildChain(int depth) {
+    CommandHandler[auto~] res;
+    PathTraceStep[auto~] steps; // track them forward ..
+    for 0..depth {
+      auto pts = new PathTraceStep; // rays ++
+      
+      steps ~= pts;
+      res ~= pts;
+      pts.startTracking(res.length);
+      res ~= rest; // results ++
+    }
+    
+    for int i <- 0..depth {
+      ref step = steps[$-1 - i];
+      step.stopTracking(res.length + 1); // skip the merge step also
+      res ~= step.mkMergeStep();
+      res ~= new FreeResult; // results --
+      res ~= new FreeRay; // rays --
+    }
+    // summary: neutral
+    return res[];
+  }
+  assert(depth >= 1);
+  if (samples == 1) {
+    res ~= buildChain depth;
+  } else {
+    auto pt = new PathTraceStep(2 /* skip two results (our empty averager and the counter) */);
+    auto fr = new FreeRay;
+    // skip one result that we're using as a store for the loop counter
+    auto as = new AverageStep (samples, 1);
+    auto fs = new FreeResult;
+    res ~= new AllocEmptyResult; // loop counter - results ++
+    
+    res ~= new AllocEmptyResult; // results ++
+    
+    auto buildChainMemo = memo &buildChain;
+    res ~= repeat(1 /* counter is one deep */, samples, λ{
+      CommandHandler[auto~] res;
+      res ~= pt; // rays ++
+      pt.startTracking(res.length);
+      res ~= rest; // results ++
+      res ~= buildChainMemo(depth - 1);
+      res ~= as;
+      pt.stopTracking(res.length);
+      res ~= fr; // rays --
+      res ~= fs; // results --
+      return res[];
+    });
+    res ~= new SwapAndDiscardRes; // results --
+    res ~= pt.mkMergeStep();
+    res ~= fs; // results --
+    // neutral
+  }
+  res ~= new RecordResultStep;
+  return res[];
 }
 
 class PathTraceLighting : SceneObject {
@@ -161,85 +244,17 @@ class PathTraceLighting : SceneObject {
   void init(SceneObject sup, sup2, int depth) { init(1, sup, sup, depth); }
   void init(int avg, SceneObject sup, int depth) { init(avg, sup, sup, depth); }
   void init(int avg, SceneObject sup, sup2, int depth) this.(sup, sup2, avg, depth) = (sup, sup2, avg, depth);
-  CommandHandler[] buildCommandStream(VMStats* stats) {
-    auto backupstats = *stats;
-    onSuccess {
-      if (backupstats.(results-needed-cur + 1 != stats.results-needed-cur
-                     ||rays-needed-cur != stats.rays-needed-cur))
-      {
-        writeln "unbalanced - $(stats.(results-needed-cur, rays-needed-cur)) but $(backupstats.(results-needed-cur, rays-needed-cur))";
-        fail;
-      }
-    }
-    
-    CommandHandler[auto~] res;
-    
-    auto stream = sup.buildCommandStream(stats);
-    res ~= stream; // results ++
-    void buildChain(int depth) {
-      PathTraceStep[auto~] steps; // track them forward ..
-      for 0..depth {
-        stats.needsRay;
-        auto pts = new PathTraceStep; // rays ++
-        
-        steps ~= pts;
-        res ~= pts;
-        pts.startTracking(res.length);
-        res ~= sup2.buildCommandStream(stats); // results ++
-      }
-      
-      for int i <- 0..depth {
-        ref step = steps[$-1 - i];
-        step.stopTracking(res.length + 1); // skip the merge step also
-        res ~= step.mkMergeStep();
-        stats.results-needed-cur --;
-        res ~= new FreeResult; // results --
-        stats.rays-needed-cur --;
-        res ~= new FreeRay; // rays --
-      }
-      
-      // summary: neutral
-    }
-    assert(depth >= 1);
-    if (avg == 1) {
-      buildChain depth;
-    } else {
-      int base-id = stats.results-needed-cur;
-      stats.needsResult;
-      auto stream2 = sup2.buildCommandStream(stats);
-                                  // if skipping, there's really no need to do the average step either
-      auto pt = new PathTraceStep(1 /* skip one result (our empty averager) */);
-      auto fr = new FreeRay;
-      auto as = new AverageStep (avg, base-id, base-id + 1);
-      auto fs = new FreeResult;
-      res ~= new AllocEmptyResult; // results ++
-      for (int i = 0; i < avg; ++i) {
-        stats.needsRay;
-        res ~= pt; // rays ++
-        pt.startTracking(res.length);
-        res ~= stream2; // results ++
-        buildChain(depth - 1);
-        res ~= as;
-        pt.stopTracking(res.length);
-        stats.rays-needed-cur --;
-        res ~= fr; // rays --
-        res ~= fs; // results --
-      }
-      stats.results-needed-cur -= 2; // free twice
-      res ~= pt.mkMergeStep();
-      res ~= fs; // results --
-      // neutral
-    }
-    res ~= new RecordResultStep;
-    return res[];
+  override CommandHandler[] buildCommandStream() {
+    return mkPathTraceLighting(sup.buildCommandStream(), sup2?.buildCommandStream(), avg, depth)
+         ~ new RecordResultStep;
   }
 }
 
 class PlainLighting : SceneObject {
   SceneObject sup;
   void init(SceneObject sup) this.sup = sup;
-  CommandHandler[] buildCommandStream(VMStats* stats) {
-    auto stream = sup.buildCommandStream(stats);
+  CommandHandler[] buildCommandStream() {
+    auto stream = sup.buildCommandStream();
     
     CommandHandler[auto~] res;
     res ~= stream;

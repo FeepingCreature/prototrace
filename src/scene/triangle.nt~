@@ -269,7 +269,7 @@ struct TriangleNode {
 int[] tricache;
 int hash;
 
-// extern(C) void fast_triangleset_process(Ray**, Result**, VMState*, int, TriangleInfo* info, TriangleNode *root, int* tricache, int *hashp, void* self);
+extern(C) void fast_triangleset_process(Ray**, Result**, VMState*, int, TriangleInfo* info, TriangleNode *root, int* tricache, int *hashp, void* self);
 
 class TriangleSet : SceneObject {
   TriangleNode* root;
@@ -320,7 +320,7 @@ class TriangleSet : SceneObject {
     // ray hits both children: 2 tests + 4 at the next level = 6 tests => 4 tests
     void two_to_four(TriangleNode* tnode) {
       if (tnode.(children.length == 2 && children[0].children.length == 2 && children[1].children.length == 2)) {
-        auto newchildren = new TriangleNode*[] 4;
+        auto newchildren = new TriangleNode*[] 4 #.ptr;
         for (int i1, (int i2, int i3)) <- zip(0..4, cross(0..2, 0..2))
           newchildren[i1] = tnode.children[i2].children[i3];
         tnode.children = newchildren;
@@ -334,8 +334,7 @@ class TriangleSet : SceneObject {
   bool collide(Ray* ray, Result* res) { _interrupt 3; }
   void process(VMState[] list) {
     if (tricache.length != info.length) { tricache.free; tricache = new int[] info.length; }
-    assert(false);
-    // fast_triangleset_process(rayplanes.ptr, resplanes.ptr, list.ptr, list.length, info.ptr, root, tricache.ptr, &hash, void*:CommandHandler:this);
+    fast_triangleset_process(rayplanes.ptr, resplanes.ptr, list.ptr, list.length, info.ptr, root, tricache.ptr, &hash, void*:CommandHandler:this);
   }
   CommandHandler[] buildCommandStream(VMStats* stats) {
     stats.needsResult;

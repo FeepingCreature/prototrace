@@ -4,11 +4,15 @@ import scene.base, c.math;
 
 // shared long testcount;
 
+PreHandler mkSphere(vec3f center, float radius) {
+  return new CommandPreHandler(new Sphere(center, radius));
+}
+
 class Sphere : SceneObject, CommandHandler {
   vec3f center;
-  float radius, rsq;
-  void init(vec3f c, float r) { center = c; radius = r; rsq = radius * radius; }
-  string toString() return "Sphere\t<$center, $radius>";
+  float radius, rsq, invr;
+  void init(vec3f c, float r) { center = c; radius = r; rsq = radius * radius; invr = 1 / radius; }
+  string toString() return "Sphere { $center, $radius }";
   bool collide(Ray* ray, Result* res) {
     vec3f pos = ray.pos - center; // pretranslate so we can pretend that we're a sphere around the origin
     vec3f dir = ray.dir;
@@ -30,23 +34,25 @@ class Sphere : SceneObject, CommandHandler {
     }
     return true;
   }
+  override bool irregularStep() { return false; }
   override void process(VMState[] list, int start, end) {
-    auto rsq = rsq, center = center, invr = 1f / radius;
+    auto rsq = rsq, center = center, invr = invr;
     // int tc;
     // onExit testcount += tc;
+    float onedivfour = 1f / 4;
     for int i <- start .. end {
       ref sp = list[i];
       
-      if (sp.handler !is CommandHandler:this) continue;
+      if (sp.handler !is CommandHandler:this) fail;
       sp.stream = sp.stream[1..$];
       
       // tc ++;
       
       using sp mixin(allocResult);
-      vec3f (pos, dir) = rayplanes[sp.ray-id-1][i].(pos, dir);
+      vec3f (pos, dir) = rayplanes[sp.ray-id][i].(pos, dir);
       pos -= center; // pretranslate so we can pretend that we're a sphere around the origin
       
-      ref res = resplanes[sp.result-id-1][i];
+      ref res = resplanes[sp.result-id][i];
       
       // algorithm 1
       /*float k = -(dir * pos).sum / (dir*dir).sum;
@@ -59,20 +65,62 @@ class Sphere : SceneObject, CommandHandler {
       // algorithm 2
       float p = (2 * pos * dir).sum;
       
-      float inside = (p*p/4 + rsq) - (pos*pos).sum;
+      float inside = (p*p*onedivfour + rsq) - (pos*pos).sum;
       if (inside < 0) continue;
       float sq = sqrt inside,
         k = -p/2,
-        k1 = k + sq,
-        k2 = k - sq;
+        k1 = k - sq,
+        k2 = k + sq;
       
+      /*
+      printf("d: 2 * pos * dir: %f, %f, %f\n", (2*pos*dir).(double:x, double:y, double:z));
+      printf("d: 2 * pos * dir: %p, %p, %p\n", (2*pos*dir).(x, y, z));
+      
+      printf("deb: p %f, odf %f, rsq %f, ps %f\n", double:p, double:onedivfour, double:rsq, double:(pos*pos).sum);
+      printf("deb: p %p, odf %p, rsq %p, ps %p\n", p, onedivfour, rsq, (pos*pos).sum);
+      
+      printf("debug: inside %f, sq %f, k %f, k1 %f, k2 %f\n", double:inside, double:sq, double:k, double:k1, double:k2);
+      printf("debug: inside %p, sq %p, k %p, k1 %p, k2 %p\n", inside, sq, k, k1, k2);
+      */
       // common
-      if (k1 >= 0) using res {
-        claim;
+      if (k2 > 0) {
+        // printf("debug: %f %p > 0\n", double:k2, k2);
         
-        distance = [k1, k2][k2 > 0];
+        // if the only hit we could get was k2, ie. k1 !> 0,
+        // then it was a hit from the inside.
+        ref info = infoplanes[sp.info-id][i];
+        
+        float distance;
+        if (!info.wantInsideHits()) {
+          // only k1 matters
+          if (k1 !> 0) continue;
+          distance = k1;
+          res.claim (
+            distance => distance,
+            fromInside => false
+          );
+        } else if (!info.wantOutsideHits()) {
+          res.claim (
+            distance => k2,
+            fromInside => true
+          );
+        } else {
+          distance = [k2, k1][k1 > 0];
+          res.claim (
+            distance => distance,
+            fromInside => k1 !> 0
+          );
+        }
+        
         vec3f normal = pos + dir * distance; // sphere around the origin, remember
-        that.normal = normal * invr;
+        res.normal = normal.normalized; // normal really has to be, yanno, _normal_
+        // so we can't do this, it's too imprecise
+        /*
+        res.normal = normal * invr;
+        if (|res.normal| > 2) {
+          writeln "weird! normal: $(normal.xyz) # $(res.normal.xyz) = $(pos.xyz) + $(dir.xyz) * $distance, with invr $invr";
+        }
+        */
       }
     }
   }

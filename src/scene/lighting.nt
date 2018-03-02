@@ -1,6 +1,6 @@
 module scene.lighting;
 
-import scene.base, scene.util;
+import base, scene.base, scene.util, settings;
 
 class LightStep : CommandHandler {
   vec3f* lightpos;
@@ -9,8 +9,10 @@ class LightStep : CommandHandler {
   class LightMergeStep : CommandHandler {
     override void recordEffect(VMStats* stats) {
       stats.consumesRay;
+      stats.consumesInfo;
       stats.consumesResult;
     }
+    override bool irregularStep() { return false; }
     override void process(VMState[] list, int start, end) {
       for int i <- start .. end {
         auto sp = &list[i];
@@ -18,10 +20,10 @@ class LightStep : CommandHandler {
         if (void*:sp.handler == void*:CommandHandler:this)::
         sp.stream = sp.stream[1..$];
         
-        ref res = resplanes[sp.result-id-2][i];
+        ref res = resplanes[sp.result-id-1][i];
         if (res.success) {
-          ref ray1 = rayplanes[sp.ray-id-1][i];
-          ref ray2 = rayplanes[sp.ray-id-2][i];
+          ref ray1 = rayplanes[sp.ray-id-0][i];
+          ref ray2 = rayplanes[sp.ray-id-1][i];
           vec3f lightdir = (*lightpos) - ray1.pos;
           float lightdist = |lightdir|;
           lightdir = lightdir.normalized;
@@ -32,7 +34,7 @@ class LightStep : CommandHandler {
           float lightangle = lightprod.sum;
           
           vec3f resv = vec3f(0);
-          auto res2 = &resplanes[sp.result-id-1][i];
+          ref res2 = resplanes[sp.result-id][i];
           if (lightangle >= 0 && (!res2.success || res2.distance >= lightdist))
             resv = res.reflective-color * vec3f(lightangle);
           
@@ -44,27 +46,32 @@ class LightStep : CommandHandler {
     }
   }
   LightMergeStep mkMergeStep() { return new LightMergeStep; }
-  override void recordEffect(VMStats* stats) {
-    stats.addsRay;
-  }
+  override void recordEffect(VMStats* stats) { stats.addsRay; stats.addsInfo; }
+  override bool irregularStep() { return true; } // skips sometimes
   override void process(VMState[] list, int start, end) {
     for int i <- start .. end {
-      auto sp = &list[i];
+      ref sp = list[i];
       
-      if (void*:sp.handler == void*:CommandHandler:this)::
+      if (sp.handler !is CommandHandler:this) fail;
       sp.stream = sp.stream[1..$];
       
-      auto res = &resplanes[sp.result-id-1][i];
+      auto res = &resplanes[sp.result-id][i];
+      auto old_info = infoplanes[sp.info-id][i];
+      
       if (res.success) {
-        auto ray = &rayplanes[sp.ray-id-1][i];
-        auto nspos = ray.(pos + dir * (res.distance * EPS));
+        auto ray = &rayplanes[sp.ray-id][i];
+        // auto nspos = ray.(pos + dir * (res.distance * epsfl - eps));
+        auto nspos = ray.(pos + dir * res.distance);
         // writeln "nspos = $(sp.ray.(pos, dir)) @ $(res.distance) = $(nspos), lightpos $(*lightpos)";
         using sp mixin(allocRay);
         vec3f lightdir = ((*lightpos) - nspos).normalized;
-        ray = &rayplanes[sp.ray-id-1][i];
+        ray = &rayplanes[sp.ray-id][i];
+        using sp mixin(allocInfo);
+        infoplanes[sp.info-id][i].want(enter => true, leave => false);
         ray.(pos, dir) = (nspos, lightdir);
       } else {
         using sp mixin(allocRay);
+        using sp mixin(allocInfo);
         using sp mixin(allocResult);
         sp.stream = sp.stream[numBasicSteps .. $]; // skip
       }
@@ -72,39 +79,202 @@ class LightStep : CommandHandler {
   }
 }
 
-void generateOutRay(Ray* ray, Ray* prev-ray, vec3f start, Result* resinfo) {
-  ray.(pos, dir) = (start, rand_sphere());
-  auto normal = resinfo.normal;
+alias randf = base.randf;
+
+vec3f mirror(vec3f a, n) {
+  auto p = n * (n*a).sum;
+  return a + 2*(p - a);
+}
+
+struct RCacheEntry {
+  vec4f v;
+  alias value = v.xyz;
+  alias offset = v.w;
+}
+
+class RadianceCache {
+  RCacheEntry[] back;
+  int length, cursor;
+  alias capacity = back.length;
+  float lower, upper;
+  void init() {
+    back = new RCacheEntry[] 64;
+  }
+  void reset() {
+    length = 0; cursor = 0;
+    lower = 0; upper = 0;
+  }
+  void add(vec3f dir, float rad) {
+    auto entry = RCacheEntry:vec4f(dir, upper + rad);
+    if (length < back.length) {
+      back[length] = entry;
+      length ++;
+    } else {
+      lower = back[cursor].offset;
+      back[cursor] = entry;
+      cursor = (cursor + 1) % capacity;
+    }
+    upper += rad;
+  }
+  vec3f lookupRandom(float* factor) {
+    if (length == 0) { *factor = 1; return rand_sphere(); }
+    if (length == 1) {
+      // *factor = back[cursor].offset;
+      *factor = 1;
+      return back[cursor].value;
+    }
+    // length > 1...
+    int from = cursor, to = cursor + length;
+    float marker = lower + (upper - lower) * randf();
+    
+    // stochastic average
+    float sample() {
+      int pos = rand() % (length - 1);
+      ref a = back[(from + pos) % capacity];
+      ref b = back[(from + pos + 1) % capacity];
+      return b.offset - a.offset;
+    }
+    // auto average = (sample() + sample()) / 2;
+    auto average = (upper - lower) / length;
+    
+    auto first = back[from % capacity];
+    if (marker <= first.offset) {
+      auto weight = first.offset - lower;
+      if (weight == 0) weight = 1; // prevent fpes
+      *factor = average / weight;
+      return first.value;
+    }
+    // start searching from 1
+    from ++;
+    // so now that we can be certain that from - 1 is in our sequence
+    // we can use cur - prev to get the range
+    
+    // binary search
+    while (from != to) {
+      int half = from + (to - from) / 2;
+      auto prev = back[(half + length - 1) % capacity];
+      auto cur = back[half % capacity];
+      // marker in prev.offset .. cur.offset? it's cur.
+      if (prev.offset < marker <= cur.offset) {
+        auto weight = cur.offset - prev.offset;
+        if (weight == 0) weight = 1; // prevent fpes
+        *factor = average / weight;
+        /*scope string[auto~] info;
+        float base = lower;
+        for (int i = 0; i < length; ++i) {
+          auto entry = back[(cursor + i) % capacity];
+          auto sz = entry.offset - base;
+          info ~= "$(entry.value) on $sz";
+          base = entry.offset;
+        }
+        import std.string;
+        writeln $ "lookupRandom in ["~info[].join(", ")~"]:\n $(cur.value) of $average / $weight: $(average / weight)";
+        */
+        return cur.value;
+      }
+      else if (marker <= prev.offset) to = half;
+      else if (cur.offset < marker) from = half;
+      else assert(false, "sanity violation 1");
+    }
+    assert(false, "sanity violation 2");
+  }
+}
+
+void generateOutRay(Ray* ray, Ray* prev-ray, vec3f start, Result* res, RadianceCache rcache) {
+  auto normal = res.normal;
   // flip the normal if we approached the surface from the "backside"
   // this accounts for things like triangle models where a triangle may be visible from both sides
   // on an unrelated note, fuck those bullshit models
-  if ((normal * prev-ray.dir).sum >= 0)
-    normal = -normal;
   
-  if (ray.dir * normal).sum < 0 ray.dir = -ray.dir;
+  // otoh, this makes big problems with the lighting calculation
+  // TODO account for this in PathTraceStep also
+  // if ((normal * prev-ray.dir).sum >= 0)
+  //   normal = -normal;
+  
+  res.biasInfo.usingBiasedSample = false;
+  
+  ray.pos = start;
+  
+  if (res.reflect > 0 && randf() < res.reflect) {
+    // writeln "start with $(prev-ray.dir) inverted $(-prev-ray.dir)";
+    // writeln "mirror around $normal";
+    ray.dir = mirror(-prev-ray.dir, normal);
+    // writeln "$(ray.dir) test $(((ray.dir*normal).sum, (-prev-ray.dir*normal).sum, (-prev-ray.dir*ray.dir).sum));";
+    return;
+  }
+  
+  while true {
+    if (rcache && randf() < 0.9) {
+      ray.dir = rcache.lookupRandom(&float factor);
+      res.biasInfo.usingBiasedSample = true;
+      res.biasInfo.sampleFactor = factor;
+    } else {
+      ray.dir = rand_sphere();
+    }
+    
+    float dot = (ray.dir * normal).sum;
+    if dot < 0 {
+      ray.dir = -ray.dir;
+      dot = -dot;
+    }
+    
+    // cosine sampling
+    float reflchance = dot; // lambert
+    if (randf() < reflchance) break;
+    // linear sampling
+    // break;
+  }
+}
+
+RadianceCache rcache; // tls
+RadianceCache getRCache() {
+  if (!rcache) rcache = new RadianceCache;
+  return rcache;
 }
 
 class PathTraceStep : CommandHandler {
-  int skip, res-delta;
+  int skip;
   int skip-start;
-  void init(int rd = 0) { res-delta = rd; skip-start = -1; skip = -1; }
+  bool useRCache;
+  void init(bool useRadianceCache) { skip-start = -1; skip = -1; useRCache = useRadianceCache; }
   void startTracking(int at) {
     skip-start = at;
   }
   class PathTraceMergeStep : CommandHandler {
     override void recordEffect(VMStats* stats) { }
+    override bool irregularStep() { return false; }
     override void process(VMState[] list, int start, end) {
+      RadianceCache rcache;
+      if (useRCache) rcache = getRCache();
       for int i <- start .. end {
         ref  sp = list[i];
         
         if (sp.handler !is CommandHandler:this) continue;
         sp.stream = sp.stream[1..$];
         
-        ref res = resplanes[sp.result-id-2][i];
+        ref res = resplanes[sp.result-id-1][i];
         if (res.success) {
-          ref res2 = resplanes[sp.result-id-1][i];
+          ref res2 = resplanes[sp.result-id-0][i];
           if (res2.success) {
-            res.emissive-color += res.reflective-color * res2.emissive-color;
+            auto incoming-light = res2.emissive-color;
+            ref ray2 = rayplanes[sp.ray-id][i];
+            /*if (res2.hitFromInside) {
+              writeln "logic snafu - lighting from inside hit? $(res2.distance) for $(ray2.pos.xyz) -> $(ray2.dir.xyz)";
+            }*/
+            if (res.biasInfo.usingBiasedSample) {
+              incoming-light *= res.biasInfo.sampleFactor;
+            } else {
+              rcache?.add(ray2.dir, |incoming-light| + 0.5);
+            }
+            // cosine weighting
+            /*
+            float in_angle = (res.normal * ray2.dir).sum;
+            // if (in_angle > 1 || in_angle < 0) writeln "weird in_angle: $in_angle for $(res.normal.xyz) vs. $(ray2.dir.xyz)";
+            // lambert shading
+            res.emissive-color += res.reflective-color * incoming-light * in_angle * 2f;
+            */
+            // linear weighting
+            res.emissive-color += res.reflective-color * incoming-light;
           } else {
             // res.emissive-color += vec3f(1, 0, 0);
           }
@@ -117,14 +287,16 @@ class PathTraceStep : CommandHandler {
     auto delta = (at - skip-start);
     skip = delta;
   }
-  auto mkMergeStep() {
+  auto mkMergeStep(bool useRadianceCache) {
     assert(skip != -1);
     return new PathTraceMergeStep;
   }
-  override void recordEffect(VMStats* stats) {
-    stats.addsRay;
-  }
+  override void recordEffect(VMStats* stats) { stats.addsRay; }
+  override bool irregularStep() { return true; }
   override void process(VMState[] list, int start, end) {
+    RadianceCache rcache;
+    if (useRCache) rcache = getRCache();
+    
     auto self = CommandHandler:this;
     for int i <- start .. end {
       ref sp = list[i];
@@ -134,16 +306,17 @@ class PathTraceStep : CommandHandler {
       
       using sp mixin(allocRay);
       
-      ref res = resplanes[sp.result-id-1 - res-delta][i];
-      if (res.success && res.reflective-color != vec3f(0)) {
-        ref ray = rayplanes[sp.ray-id-2][i];
-        ref ray2 = rayplanes[sp.ray-id-1][i];
-        auto nspos = ray.(pos + dir * (res.distance * EPS));
-        // writeln "nspos = $(ray.(pos, dir)) @ $(res.distance) = $(nspos)";
-        generateOutRay(&ray2, &ray, nspos, &res);
+      ref res = resplanes[sp.result-id][i];
+      // if (res.distance == float.infinity) res.success = false;
+      if (res.success && res.reflective-color != vec3f(0) && res.distance != float.infinity) {
+        ref ray = rayplanes[sp.ray-id-1][i];
+        ref ray2 = rayplanes[sp.ray-id-0][i];
+        auto nspos = ray.(pos + dir * res.distance);
+        // nspos += res.normal * eps;
+        generateOutRay(&ray2, &ray, nspos, &res, rcache);
       } else {
         using sp mixin(allocResult);
-        ref res2 = resplanes[sp.result-id-1][i];
+        ref res2 = resplanes[sp.result-id][i];
         res2.success = false;
         sp.stream = sp.stream[skip .. $]; // no point
       }
@@ -176,16 +349,28 @@ template memo(T) {
   }
 }
 
-CommandHandler[] mkPathTraceLighting(CommandHandler[] first, rest, int samples, depth) {
+class PrePathTrace : PreHandler {
+  PreHandler sub;
+  int samples, depth;
+  void init(PreHandler sub, int samples, depth) this.(sub, samples, depth) = (sub, samples, depth);
+  override void iterate(void delegate(PreHandler) dg) { dg sub; }
+  override CommandHandler[] flatten() { return buildPathTraceLighting(scope= sub.flatten(), null, samples, depth); }
+}
+
+PreHandler mkPathTraceLighting(PreHandler pre, int samples, depth) {
+  return new PrePathTrace(pre, samples, depth);
+}
+
+CommandHandler[] buildPathTraceLighting(CommandHandler[] first, rest, int samples, depth) {
   if (!rest) rest = first;
   CommandHandler[auto~] res;
   
-  res ~= first; // results ++
   CommandHandler[] buildChain(int depth) {
     CommandHandler[auto~] res;
     PathTraceStep[auto~] steps; // track them forward ..
-    for 0..depth {
-      auto pts = new PathTraceStep; // rays ++
+    for (int i, bool isFirst) <- [for i <- 0..depth: (i, i == 0)] {
+      bool useRadianceCache = isFirst && settings.enableRCache;
+      auto pts = new PathTraceStep useRadianceCache; // rays ++
       
       steps ~= pts;
       res ~= pts;
@@ -193,46 +378,43 @@ CommandHandler[] mkPathTraceLighting(CommandHandler[] first, rest, int samples, 
       res ~= rest; // results ++
     }
     
-    for int i <- 0..depth {
+    for (int i, bool isLast) <- [for i <- 0..depth: (i, i == depth - 1)] {
       ref step = steps[$-1 - i];
       step.stopTracking(res.length + 1); // skip the merge step also
-      res ~= step.mkMergeStep();
+      bool useRadianceCache = isLast && settings.enableRCache;
+      res ~= step.mkMergeStep(useRadianceCache);
       res ~= new FreeResult; // results --
       res ~= new FreeRay; // rays --
     }
     // summary: neutral
     return res[];
   }
-  assert(depth >= 1);
+  assert(depth >= 0);
   if (samples == 1) {
+    res ~= first; // results ++
     res ~= buildChain depth;
   } else {
-    auto pt = new PathTraceStep(2 /* skip two results (our empty averager and the counter) */);
     auto fr = new FreeRay;
-    // skip one result that we're using as a store for the loop counter
-    auto as = new AverageStep (samples, 1);
+    auto as = new AverageStep (samples);
     auto fs = new FreeResult;
-    res ~= new AllocEmptyResult; // loop counter - results ++
+    auto jr = new JitterRay;
     
-    res ~= new AllocEmptyResult; // results ++
+    res ~= new AllocEmptyResult; // average target, results ++
     
     auto buildChainMemo = memo &buildChain;
-    res ~= repeat(1 /* counter is one deep */, samples, λ{
+    res ~= repeat(0 /* use average target .data */, samples, λ{
       CommandHandler[auto~] res;
-      res ~= pt; // rays ++
-      pt.startTracking(res.length);
-      res ~= rest; // results ++
-      res ~= buildChainMemo(depth - 1);
+      res ~= jr; // rays ++;
+      res ~= first; // results ++
+      
+      res ~= buildChainMemo depth;
+      
       res ~= as;
-      pt.stopTracking(res.length);
       res ~= fr; // rays --
       res ~= fs; // results --
       return res[];
     });
-    res ~= new SwapAndDiscardRes; // results --
-    res ~= pt.mkMergeStep();
-    res ~= fs; // results --
-    // neutral
+    // summary: results = results + 1
   }
   res ~= new RecordResultStep;
   return res[];
@@ -245,7 +427,7 @@ class PathTraceLighting : SceneObject {
   void init(int avg, SceneObject sup, int depth) { init(avg, sup, sup, depth); }
   void init(int avg, SceneObject sup, sup2, int depth) this.(sup, sup2, avg, depth) = (sup, sup2, avg, depth);
   override CommandHandler[] buildCommandStream() {
-    return mkPathTraceLighting(sup.buildCommandStream(), sup2?.buildCommandStream(), avg, depth)
+    return buildPathTraceLighting(sup.buildCommandStream(), sup2?.buildCommandStream(), avg, depth)
          ~ new RecordResultStep;
   }
 }

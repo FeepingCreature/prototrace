@@ -1,0 +1,336 @@
+module woo2pt;
+
+import std.string, std.file, std.wren, std.parser, std.matrix, std.math, std.random;
+
+void main() {
+  string[auto~] lines = (string:readAll("test.woo")).split("\n");
+  // while (auto line = readln()) lines ~= line;
+  
+  string[auto~] output;
+  void writeln(string s) {
+    // fprintf(stderr, "! %.*s\n", s);
+    output ~= s;
+  }
+  void printResult() { auto str = output.join(" "); fprintf(stderr, "%% %.*s\n", str[]); .writeln str; }
+  
+  (string, void delegate())[auto~] rules;
+  void call(string s) {
+    for auto dg <- rules if dg[0] == s { dg[1](); return; }
+    fail "no such rule: '$s'";
+  }
+  
+  string vecstr(vec3f v) {
+    return "$(v.x) $(v.y) $(v.z) vec3f";
+  }
+  
+  vec3f pos;
+  vec3f scale = vec3f(1);
+  float rx, ry, rz;
+  vec3f diffuse = vec3f(1);
+  
+  void getTransformMatrix(Matrix4x4* resp) {
+    alias res = *resp;
+    res = Matrix4x4-ident;
+    // backwards to how pt/unforth does it
+    res.translate(pos);
+    res.rotate(rz, vec3f.Z);
+    res.rotate(ry, vec3f.Y);
+    res.rotate(rx, vec3f.X);
+    res.scale(scale);
+  }
+  
+  void setPos(vec3f v) {
+    getTransformMatrix(&Matrix4x4 mat);
+    pos = mat.multiply(v, 0);
+    // .writeln "setpos: $v to $pos because $rx, $ry, $rz";
+  }
+  vec3f transformedPos() {
+    getTransformMatrix(&Matrix4x4 mat);
+    // auto backup = mat;
+    mat.invert();
+    // auto test = backup * mat;
+    return mat.multiply(pos, 0);
+  }
+  
+  void setScale(vec3f v) {
+    scale = v;
+  }
+  
+  void place(vec3f a, b) {
+    if (scale != vec3f(1)) writeln "$(vecstr scale) scale";
+    if (rx != 0) writeln "X $rx rotate";
+    if (ry != 0) writeln "Y $ry rotate";
+    if (rz != 0) writeln "Z $rz rotate";
+    if (pos.(x != 0 || y != 0 || z != 0))
+      writeln "$(vecstr pos) translate";
+    writeln "$(vecstr diffuse) color";
+    getTransformMatrix(&Matrix4x4 mat);
+    vec3f from = vec3f(float.infinity), to = vec3f(-float.infinity);
+    void addPt(vec3f v) {
+      for int i <- 0..3 {
+        from[i] = min(from[i], v[i]);
+        to  [i] = max(to  [i], v[i]);
+      }
+    }
+    for auto x <- [a.x, b.x] for auto y <- [a.y, b.y] for auto z <- [a.z, b.z] {
+      auto v = vec3f(x, y, z);
+      v = mat.multiply(v, 1);
+      addPt(v);
+    }
+    // fprintf(stderr, "%.*s\n", "for $a, $b: $(vecstr from) $(vecstr to) bound");
+    writeln "$(vecstr from) $(vecstr to) bound";
+    writeln "group";
+  }
+  
+  rules ~= ("box", λ{
+    writeln "box";
+    place(vec3f(0), vec3f(1));
+  });
+  
+  string getLine() {
+    if (!lines.length) fail "ran out of lines";
+    auto line = lines[0];
+    lines = lines[1..$];
+    return line;
+  }
+  
+  string lineStarts(string s) {
+    auto line = getLine().strip();
+    if (!line.length) return lineStarts(s); // skip empty lines
+    if (auto res = line.startsWith s) return res.strip();
+    fail "expected start '$s' at \"$line\"";
+  }
+  
+  void delegate() callParens(string s) {
+    if (auto name = s.startsWith("(").endsWith(")").strip()) {
+      return new λ{ call name; }
+    }
+    fail "expected (rule), not '$s'";
+  }
+  
+  void delegate() callRepeating(string s) {
+    using parser using scoped text = s {
+      expect("(");
+      auto rule = getIdentifier();
+      expect(",");
+      auto count = getNumber();
+      expect(")");
+      expectDone;
+      return new λ{
+        for 0..count call rule;
+      }
+    }
+  }
+  
+  alias Expr = Thing delegate(Thing);
+  
+  Expr lookupNamedThing(string s) {
+    template capture(T) {
+      Thing delegate(Thing) capture(T* tp) {
+        return new λ(Thing t) {
+          if (t) *tp = wren-to-neat!T t;
+          return neat-to-wren *tp;
+        }
+      }
+    }
+    if (s == "pos") return new λ(Thing t) {
+      if (t) setPos(wren-to-neat!vec3f t);
+      return neat-to-wren transformedPos();
+    }
+    if (s == "scale") return new λ(Thing t) {
+      if (t) setScale(wren-to-neat!vec3f t);
+      return neat-to-wren scale;
+    }
+    if (s == "diff") return capture!vec3f(&diffuse);
+    if (s == "rx") return capture!float(&rx);
+    if (s == "ry") return capture!float(&ry);
+    if (s == "rz") return capture!float(&rz);
+    fail "no such variable: '$s'";
+  }
+  
+  Expr getProperty(Expr ex, string sub) {
+    return new λ(Thing t) {
+      auto self = ex(null);
+      
+      if (Vec3f:self) {
+        auto v = wren-to-neat!vec3f self;
+        if (t) {
+          if      (sub == "x") v.x = wren-to-neat!float t;
+          else if (sub == "y") v.y = wren-to-neat!float t;
+          else if (sub == "z") v.z = wren-to-neat!float t;
+          else fail "vec3f has no such property: '$sub'";
+          ex(neat-to-wren v); // write back
+        }
+        if      (sub == "x") return neat-to-wren v.x;
+        else if (sub == "y") return neat-to-wren v.y;
+        else if (sub == "z") return neat-to-wren v.z;
+        else fail "vec3f still has no such property: '$sub', wtf internal error";
+      }
+      fail "don't know how to find property '$sub' of $self";
+    }
+  }
+  
+  Expr op(string op, Expr e1, e2) {
+    return new λ(Thing t) {
+      if (t) fail "cannot assign to arithmetic expression";
+      auto t1 = e1(null), t2 = e2(null);
+      if (Vec3f:t1 || Vec3f:t2) {
+        if (auto num = Number :t1) t1 = new Vec3f(vec3f(num.num));
+        if (auto i   = Integer:t1) t1 = new Vec3f(vec3f(  i.num));
+        if (auto num = Number :t2) t2 = new Vec3f(vec3f(num.num));
+        if (auto i   = Integer:t2) t2 = new Vec3f(vec3f(  i.num));
+        auto v1 = Vec3f:t1, v2 = Vec3f:t2;
+        assert(v1 && v2);
+        if (op == "+") return neat-to-wren(v1.value + v2.value);
+        if (op == "-") return neat-to-wren(v1.value - v2.value);
+        if (op == "*") return neat-to-wren(v1.value * v2.value);
+        if (op == "/") return neat-to-wren(v1.value / v2.value);
+        fail "unknown operand '$op'";
+      }
+      auto f1 = wren-to-neat!float(t1), f2 = wren-to-neat!float(t2);
+      if (op == "+") return neat-to-wren(f1 + f2);
+      if (op == "-") return neat-to-wren(f1 - f2);
+      if (op == "*") return neat-to-wren(f1 * f2);
+      if (op == "/") return neat-to-wren(f1 / f2);
+      fail "unknown operand '$op'";
+    }
+  }
+  
+  Expr gotExpr(string* sp) {
+    alias str = *sp;
+    using scoped parser.text = *sp {
+      onSuccess *sp = parser.text;
+      if (parser.gotFloat(&float f)) {
+        return new λ(Thing t) {
+          if (t) .fail "cannot assign to float either what are you doing";
+          return neat-to-wren f;
+        }
+      }
+      if (parser.gotNumber(&int i)) {
+        return new λ(Thing t) {
+          if (t) .fail "cannot assign to number what are you doing";
+          return neat-to-wren i;
+        }
+      }
+      using scoped parser.text using parser {
+        float getFloaty() {
+          if (gotFloat(&float f)) return f;
+          if (gotNumber(&int i)) return i;
+          parser.fail "could not parse number";
+        }
+        if (parser.accept("vec(")) {
+          auto x = getFloaty(); expect(",");
+          auto y = getFloaty(); expect(",");
+          auto z = getFloaty(); expect(")");
+          commit;
+          return new λ(Thing t) {
+            if (t) { .fail "cannot assign to vec you silly person"; }
+            return neat-to-wren vec3f(x, y, z);
+          }
+        }
+        if (parser.accept("rand(")) {
+          auto from = getFloaty(); expect(",");
+          auto to = getFloaty();   expect(")");
+          commit;
+          return new λ(Thing t) {
+            if (t) { .fail "cannot assign to random number what are you even like. what."; }
+            return neat-to-wren $ randf(deflt) * (to - from) + from;
+          }
+        }
+      }
+      // <name>
+      if (auto ident = parser.gotIdentifier()) {
+        auto thing = lookupNamedThing(ident);
+        // properties
+        while (true) {
+          // .prop
+          if (parser.accept(".")) {
+            auto sub = parser.getIdentifier();
+            thing = getProperty(thing, sub);
+            continue;
+          }
+          break;
+        }
+        return thing;
+      }
+    }
+    return null;
+  }
+  
+  Expr getExpr(string* sp) {
+    alias str = *sp;
+    if (auto res = gotExpr(sp)) return res;
+    fail "unknown expression at '$str'";
+  }
+  
+  Expr assign(Expr ex, Expr new_ex) {
+    return new λ(Thing t) {
+      if (t) fail("cannot assign to an assignment");
+      return ex(new_ex(null));
+    };
+  }
+  
+  void delegate() parseStatement(string line) {
+    if (auto rest = line.startsWith("call").strip()) {
+      return callParens(rest);
+    }
+    if (auto rest = line.startsWith("repeat").strip()) {
+      return callRepeating(rest);
+    }
+    bool ate(string s) {
+      line = line.strip();
+      if (auto rest = line.startsWith(s)) { line = rest; return true; }
+      return false;
+    }
+    if (auto ex = gotExpr(&line)) {
+      line = line.strip();
+      bool matchedAssignSt = true;
+      if      (ate("+=")) ex = assign(ex, op("+", ex, getExpr(&line)));
+      else if (ate("-=")) ex = assign(ex, op("-", ex, getExpr(&line)));
+      else if (ate("*=")) ex = assign(ex, op("*", ex, getExpr(&line)));
+      else if (ate("/=")) ex = assign(ex, op("/", ex, getExpr(&line)));
+      else if (ate( "=")) ex = assign(ex, getExpr(&line));
+      else matchedAssignSt = false;
+      
+      if (matchedAssignSt) {
+        if (line.length) fail "unknown text after assignment at '$line'";
+        return new λ{ ex(null); }; // evaluate blindly
+      }
+      
+      if (line.length) fail "unknown text after expression at '$line'";
+    }
+    fail "unknown statement at '$line'";
+  }
+  
+  void expectLine(string s) {
+    auto line = getLine().strip();
+    if (line == s) return;
+    fail "expected '$s' at \"$line\"";
+  }
+  
+  void parseRule() {
+    auto name = lineStarts("rule ");
+    expectLine("{");
+    void delegate()[auto~] dgs;
+    do auto line = getLine();
+    while (line.strip() != "}") {
+      // eat regular comments
+      if (auto noncomment = line.between("", "//")) line = noncomment;
+      line = line.strip();
+      if (!line.length) continue;
+      dgs ~= parseStatement line;
+    }
+    auto rule = new λ{
+      for auto dg <- dgs dg();
+    }
+    rules ~= (name, rule);
+  }
+  
+  while lines.length parseRule;
+  
+  writeln "nothing"; // for things to group onto
+  call "main";
+  // writeln "skyground-gray group X -30 rotate pathtrace render";
+  
+  printResult;
+}

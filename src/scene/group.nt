@@ -2,12 +2,47 @@ module scene.group;
 
 import scene.base;
 
+class PreGroup : PreHandler {
+  PreHandler a, b;
+  void init(PreHandler a, b) this.(a, b) = (a, b);
+  override void iterate(void delegate(PreHandler) dg) { dg a; dg b; }
+  override CommandHandler[] flatten() {
+    // TODO balance nested groups
+    CommandHandler[auto~] res;
+    res ~= scope= a.flatten();
+    res ~= scope= b.flatten();
+    res ~= new MergeTwo(false);
+    return res[];
+  }
+}
+
+PreHandler mkGroup(PreHandler a, b) {
+  // TODO: memoize for efficiency?
+  int count_leaves(PreHandler hdl) {
+    if (auto grp = PreGroup: hdl) {
+      return count_leaves(grp.a) + count_leaves(grp.b);
+    }
+    return 1;
+  }
+  int la = count_leaves(a), lb = count_leaves(b);
+  // wlog a is smaller
+  if (la > lb) (la, lb, a, b) = (lb, la, b, a);
+  if (2 * la < lb) { // grossly unbalanced
+    PreHandler (ba, bb) = (PreGroup:b).(a, b);
+    int lba = count_leaves(ba), lbb = count_leaves(bb);
+    // wlog ba is smaller
+    if (lba > lbb) (lba, lbb, ba, bb) = (lbb, lba, bb, ba);
+    // rebalance: return group(group(smallest, smaller), larger)
+    return mkGroup(mkGroup(a, ba), bb);
+  }
+  return new PreGroup(a, b);
+}
+
 class MergeTwo : CommandHandler {
   bool empty;
   void init(bool e = false) empty = e;
-  override void recordEffect(VMStats* stats) {
-    stats.consumesResult;
-  }
+  override void recordEffect(VMStats* stats) { stats.consumesResult; }
+  override bool irregularStep() { return false; }
   override void process(VMState[] list, int start, end) {
     if (empty) {
       for int i <- start .. end {
@@ -16,7 +51,7 @@ class MergeTwo : CommandHandler {
         sp.stream = sp.stream[1..$];
         
         sp.result-id ++;
-        resplanes[sp.result-id-1][i].success = 0;
+        resplanes[sp.result-id][i].success = 0;
       }
       return;
     }
@@ -25,15 +60,24 @@ class MergeTwo : CommandHandler {
       if (sp.handler !is CommandHandler:this) continue;
       sp.stream = sp.stream[1..$];
       
-      ref res1 = resplanes[sp.result-id-1][i];
-      if (!res1.success) { }
+      ref res_top = resplanes[sp.result-id][i];
+      if (!res_top.success) { }
       else {
-        ref res2 = resplanes[sp.result-id-2][i];
-        if (!res2.success) {
-          res2 = res1;
+        ref res_bot = resplanes[sp.result-id-1][i];
+        if (!res_bot.success) {
+          res_bot.copyFrom &res_top;
         } else {
-          if (res2.distance <= res1.distance) { }
-          else res2 = res1;
+          /*if (res_top.hitFromInside != res_bot.hitFromInside) {
+            writeln "debug: $(res_top.hitFromInside) vs. $(res_bot.hitFromInside) and $(res_top.distance) vs. $(res_bot.distance)";
+          }*/
+          bool copy_over = res_bot.distance > res_top.distance; // copy top over bot
+          if (res_top.hitFromInside != res_bot.hitFromInside) { // mismatched-hits situation
+            if (res_top.distance / res_bot.distance < 0.001) copy_over = false; // res_top much smaller than res_bot
+            if (res_bot.distance / res_top.distance < 0.001) copy_over = true; // res_bot much smaller than res_top
+          }
+          if (copy_over) {
+            res_bot.copyFrom &res_top;
+          }
         }
       }
       sp.result-id --;

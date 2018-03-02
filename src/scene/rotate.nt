@@ -1,0 +1,65 @@
+module scene.rotate;
+
+import scene.base;
+
+class Rotate : CommandHandler {
+  vec3f axis; float angle;
+  void init(vec3f x, float a) { axis = x; angle = a; }
+  override {
+    void process(VMState[] list, int start, end) {
+      for int i <- start .. end {
+        auto sp = &list[i];
+        
+        if (void*:sp.handler == void*:CommandHandler:this)::
+        sp.stream = sp.stream[1..$];
+        
+        ref ray = rayplanes[sp.ray-id][i];
+        using sp mixin(allocRay);
+        // rotate the camera counterwise
+        rayplanes[sp.ray-id][i].(pos, dir) = ray.(pos.rotate3f(axis, -angle), dir.rotate3f(axis, -angle));
+      }
+    }
+    bool irregularStep() { return false; }
+    void recordEffect(VMStats* stats) { stats.addsRay(); }
+  }
+  class PostRotate : CommandHandler {
+    override {
+      void process(VMState[] list, int start, end) {
+        for int i <- start .. end {
+          auto sp = &list[i];
+          
+          if (void*:sp.handler == void*:CommandHandler:this)::
+          sp.stream = sp.stream[1..$];
+          
+          using sp mixin(freeRay.replace("!!", "1"));
+          
+          ref rp = resplanes[sp.result-id][i];
+          // rotate normal with object
+          rp.normal = rp.normal.rotate3f(axis, angle);
+        }
+      }
+      bool irregularStep() { return false; }
+      void recordEffect(VMStats* stats) { stats.consumesRay(); }
+    }
+  }
+  PostRotate mkPostRotate() { return new PostRotate; }
+}
+
+CommandHandler[] buildRotate(vec3f axis, float angle, CommandHandler[] obj) {
+  CommandHandler[auto~] res;
+  auto rt = new Rotate(axis, angle);
+  res ~= rt;
+  res ~= obj;
+  res ~= rt.mkPostRotate();
+  return res[];
+}
+
+class PreRotate : PreHandler {
+  vec3f axis; float angle;
+  PreHandler sub;
+  void init(vec3f axis, float angle, PreHandler sub) this.(axis, angle, sub) = (axis, angle, sub);
+  override void iterate(void delegate(PreHandler) dg) { dg sub; }
+  override CommandHandler[] flatten() { return buildRotate(axis, angle, scope= sub.flatten()); }
+}
+
+PreHandler mkRotate(vec3f axis, float angle, PreHandler sub) { return new PreRotate(axis, angle, sub); }

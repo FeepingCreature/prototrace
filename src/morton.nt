@@ -1,0 +1,69 @@
+module morton;
+
+context morton_cache {
+  int[] window;
+  int w, h;
+}
+
+context antimorton_cache {
+  int[] window;
+  int w, h;
+}
+
+int[] morton_window(int w, h) {
+  if (morton_cache.(w, h) == (w, h)) return morton_cache.window;
+  auto res = new int[] (w * h);
+  int i;
+  for int m <- 0..reverse_morton(w, h) {
+    vec2i v = morton[m];
+    if (v.x >= w || v.y >= h) continue;
+    res[i++] = m;
+  }
+  assert(i == w * h);
+  morton_cache.window.free;
+  morton_cache.(window, w, h) = (res, w, h);
+  return res;
+}
+
+int[] antimorton_window(int w, h) {
+  if (antimorton_cache.(w, h) == (w, h)) return antimorton_cache.window;
+  auto res = new int[] reverse_morton(w, h);
+  assert(!morton_cache.window || morton_cache.(w, h) == (w, h));
+  auto morton = morton_window(w, h);
+  for int i <- ints && auto m <- morton {
+    res[m] = i;
+  }
+  antimorton_cache.window.free;
+  antimorton_cache.(window, w, h) = (res, w, h);
+  return res;
+}
+
+alias morton = [for i <- ints: vec2i(
+  i // _f_e_d_c_b_a_9_8_7_6_5_4_3_2_1_0
+  .(((that&0x44444444) >> 1) | (that & 0x11111111)) // => __fe__dc__ba__98__76__54__32__10
+  .(((that&0x30303030) >> 2) | (that & 0x03030303)) // => ____fedc____ba98____7654____3210
+  .(((that&0x0f000f00) >> 4) | (that & 0x000f000f)) // => ________fedcba98________76543210
+  .(((that&0x00ff0000) >> 8) | (that & 0x000000ff)) // => ________________fedcba9876543210
+  , i // f_e_d_c_b_a_9_8_7_6_5_4_3_2_1_0_
+  .(that >> 1) // _f_e_d_c_b_a_9_8_7_6_5_4_3_2_1_0
+  // and continue as above
+  .(((that&0x44444444) >> 1) | (that & 0x11111111)) // => __fe__dc__ba__98__76__54__32__10
+  .(((that&0x30303030) >> 2) | (that & 0x03030303)) // => ____fedc____ba98____7654____3210
+  .(((that&0x0f000f00) >> 4) | (that & 0x000f000f)) // => ________fedcba98________76543210
+  .(((that&0x00ff0000) >> 8) | (that & 0x000000ff)) // => ________________fedcba9876543210
+)];
+
+// coordinate to morton index
+int reverse_morton(int x, y) {
+  // ________________fedcba9876543210
+  x = ((x&0x0000ff00)<<8) | (x&0x000000ff); // => ________fedcba98________76543210
+  x = ((x&0x00f000f0)<<4) | (x&0x000f000f); // => ____fedc____ba98____7654____3210
+  x = ((x&0x0c0c0c0c)<<2) | (x&0x03030303); // => __fe__dc__ba__98__76__54__32__10
+  x = ((x&0x22222222)<<1) | (x&0x11111111); // => _f_e_d_c_b_a_9_8_7_6_5_4_3_2_1_0
+  // ________________fedcba9876543210
+  y = ((y&0x0000ff00)<<8) | (y&0x000000ff); // => ________fedcba98________76543210
+  y = ((y&0x00f000f0)<<4) | (y&0x000f000f); // => ____fedc____ba98____7654____3210
+  y = ((y&0x0c0c0c0c)<<2) | (y&0x03030303); // => __fe__dc__ba__98__76__54__32__10
+  y = ((y&0x22222222)<<1) | (y&0x11111111); // => _f_e_d_c_b_a_9_8_7_6_5_4_3_2_1_0
+  return (y << 1) | x;
+}

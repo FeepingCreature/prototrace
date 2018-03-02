@@ -1,16 +1,35 @@
 module test;
 
-import std.lib.libedit;
+import std.lib.gtk;
 void main() {
-  set-handler (LinuxSignal ls) { if (ls.id == c.signal.SIGINT) invoke-exit "return"; }
-  define-exit "return" return;
+  gtk_init(null, null);
   
-  auto stream = reader();
-  onExit stream.close;
+  auto window = GTK_WINDOW _new _TOPLEVEL;
+  window.set_position (GTK_WIN_POS_CENTER);
+  window.set_default_size (250, 200);
+  window.set_title "TextView";
+  window.set_border_width 5;
   
-  prompt = "%) ";
-  for auto line <- stream {
-    writeln "$line";
-    stream.addHistory line;
-  }
+  auto vbox = GTK_VBOX _new (false, 0);
+  auto view = GTK_TEXT_VIEW _new ();
+  vbox.pack_start (view, true, true, 0);
+  
+  auto buffer = GTK_TEXT_BUFFER view.get_buffer();
+  buffer.create_tag("gap", "pixels_above_lines", 30, null);
+  buffer.create_tag("lmarg", "left_margin", 5, null);
+  buffer.create_tag("blue_fg", "foreground", char*:"blue", null);
+  buffer.create_tag("gray_bg", "background", char*:"gray", null);
+  buffer.create_tag("italic", "style", PANGO_STYLE_ITALIC, null);
+  buffer.create_tag("bold", "weight", PANGO_WEIGHT_BOLD, null);
+  
+  buffer.get_iter_at_offset(&GtkTextIter iter, 0);
+  buffer.insert(&iter, "Plain text\n", -1);
+  /*buffer.insert_with_tags_by_name(&iter, "Colored Text\n", -1, char*:"blue_fg", char*:"lmarg", null);
+  buffer.insert_with_tags_by_name(&iter, "Text with bcolored background\n", -1, char*:"lmarg", char*:"gray_bg", null);
+  buffer.insert_with_tags_by_name(&iter, "Text in italics\n", -1, char*:"italic", char*:"lmarg", null);
+  buffer.insert_with_tags_by_name(&iter, "Bold text\n", -1, char*:"bold", char*:"lmarg", null);*/
+  
+  window.add vbox;
+  window.show_all;
+  gtk_main;
 }

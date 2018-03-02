@@ -1,25 +1,20 @@
 module render;
 
-pragma(linker, "fastroutines.o");
-
-import base, scene.(base, util, texture, metro, sphere);
-import std.(string, file, thread, time, lib.opengl, macros.swap, process);
-import sdl, c.fenv;
-
-extern(C) {
-  void ray_to_coords(int dw, dh, Ray* rayp, int* xp, yp);
-  float fov;
-  int feenableexcept(int);
+import base, morton, file, scene.(base, util, texture/*, metro*/), settings;
+import std.(string, file, thread, time, macros.swap, process);
+platform(default) {
+  import std.lib.opengl;
 }
+import sdl, c.fenv, c.math;
 
-shared int markovSteps, burnInLimit;
-shared float minBrightnessFactor;
-shared (int, int) dbgPos;
-shared bool break-on-float-errors;
+platform(!*-mingw*) {
+  extern(C) int feenableexcept(int);
+}
 
 shared int iters; shared long rays;
 
 import gd;
+
 Texture* readImage(string fname) {
   if (!fname.exists()) {
     if      exists auto asPNG = "$fname.png" fname = asPNG;
@@ -37,107 +32,22 @@ Texture* readImage(string fname) {
 
 alias atoi = std.string.atoi;
 alias atof = std.string.atof;
-alias rand = scene.util.rand;
+alias rand = base.rand;
 
-void init() using settings {
-  desired-fps = 0.5;
-  threads = 4;
-  samples = 1;
-  file = "out.png";
-  stepsize = 1;
-  dbgPos = (-1, -1);
-  markovSteps = 512;
-  // burnInLimit = 128;
-  burnInLimit = 0;
-  minBrightnessFactor = 0;
-  useBoehm = false;
-  allowLensmut = true;
-  depth = 10;
-  savestep = 4;
-  // empirically determined to be fastest thereabouts. not sure why.
-  // here's a quick&dirty benchmark
-  /*
-    for t in {1..16}
-    do
-      GRP=$((1 << t))
-      TT=$(/usr/bin/time -p ./pt -r "1024x1024" -g $GRP 2>&1 |grep ^user |cut -d\  -f2)
-      echo "$GRP $TT"
-    done
-  */
-  groupsize = 256;
-}
-
-shared context settings {
-  float desired-fps;
-  int threads; // number of subdivisions
-  int samples;
-  (int, int) imgres; // fixed-size single-pass render
-  string file;
-  int stepsize;
-  bool average, useBoehm, saveFrames;
-  int depth;
-  string input;
-  float savestep;
-  int groupsize;
-  // computed
-  alias xgroupsize = groupsize * stepsize;
-  int rays-needed, results-needed;
-}
-
-void saveAs(string file, vec4f[] resbuffer, bool finalCall = false) {
-  float avg_w = 0; int sum;
-  for (int k <- 0..dw*dh) {
-    if (resbuffer[k].(w != 1 && w > 0)) {
-      avg_w += resbuffer[k].w;
-      sum ++;
-    }
-  }
-  if (!sum) {
-    writeln "Too early to save file.";
-    return;
-  }
-  avg_w /= sum;
-  /*float max_x = 0;
-  for (int k <- 0..dw*dh) {
-    if (auto x = resbuffer[k].x) > max_x max_x = x;
-  }
-  if (max_x == 0f) max_x = 1;*/
-  if (file.endsWith(".hdr")) {
-    auto colbuffer = new vec3f[] (dw * dh);
-    if (settings.average) {
-      for (int k <- 0..dw*dh) {
-        colbuffer[k] = resbuffer[k].(xyz/avg_w);
-      }
-    } else {
-      for (int k <- 0..dw*dh) {
-        colbuffer[k] = resbuffer[k].(xyz/w);
+void fp_check() {
+  /*platform(x86) {
+    if (!(mxcsr & (1 << 15))) {
+      writeln "Oops! FTZ has gotten 0. Resetting. $(mxcsr)";
+      // _interrupt 3;
+      // rtz, fz
+      mxcsr |= (3 << 13) | (1 << 15);
+      platform(!*-mingw*) {
+        if (break-on-float-errors)
+          for auto val <- [FE_DIVBYZERO, FE_INVALID/*, FE_OVERFLOW .. infs are fine* /]
+            feenableexcept val;
       }
     }
-    auto data = encodeHDR(colbuffer, dw, dh);
-    colbuffer.free;
-    writeAll(file, data);
-    data.free;
-    return;
-  }
-  auto gdp = gdImageCreateTrueColor(settings.imgres);
-  onSuccess gdImageDestroy gdp;
-  for (int k <- 0..dw*dh) {
-    vec3f col;
-    if (settings.average) {
-      col = resbuffer[k].(xyz/avg_w);
-    } else {
-      col = resbuffer[k].(xyz/w);
-    }
-    float maxf(float a, b) return [a, b][b > a];
-    if (col.(maxf(x, maxf(y, z))) > 1)
-      col /= col.(maxf(x, maxf(y, z)));
-    // col = resbuffer[k].xxx / max_x;
-    int x = k % dw, y = k / dw;
-    gdp.tpixels[y][dw - 1 - x] = floatToIntColor col;
-  }
-  auto hdl = fopen (file.toStringz(), "w");
-  gdImagePng(gdp, c.gd.FILE*: hdl);
-  fclose hdl;
+  }*/
 }
 
 float value(vec3f v, bool isBack) {
@@ -148,56 +58,62 @@ float value(vec3f v, bool isBack) {
   return res;
 }
 
-alias AllThreadsMap = (Ray[], Result[], VMState[])[];
-
-void render(int thread, int id, AllThreadsMap ray-res-vm-map, vec4f[] resbuffer) {
-  alias my-ray-map = ray-res-vm-map[thread][0];
-  alias my-res-map = ray-res-vm-map[thread][1];
-  alias my-vm-map = ray-res-vm-map[thread][2];
-  int count = settings.groupsize;
-  int xgroupsize = settings.xgroupsize;
-  
-  int from = id * xgroupsize, to = (id+1) * xgroupsize;
-  
-  using scoped recordResultDg::
-  recordResultDg = delegate void(Ray* rayp, vec3f col, bool isBack, float factor, bool isMetroHit) {
-    ray_to_coords(dw, dh, rayp, &int x, &int y);
-    
-    auto i = y * dw + x;
-    if (i >= dw*dh || i < 0) return;
-    ref rb = resbuffer[i];
-    float icolf = 1;
-    auto coln = col * icolf;
-    // writeln "record @$((x, y)): $(vec4f(coln.(x, y, z, icolf))) for $(col)";
-    // writeln "at $((x, y)), record $(vec4f(coln.(x, y, z, icolf))) for $(col), adding to $(rb)";
-    if (x == dbgPos[0] && y == dbgPos[1]) {
-      writeln "at $((x, y)), record $(vec4f(coln.(x, y, z, icolf))) * $factor for $(col), adding to $(rb)";
+template resize-to(T) {
+  void resize-to(T t) {
+    alias array = *t[0];
+    alias length = t[1];
+    alias type = type-of array[0];
+    if (array.length != length) {
+      array.free;
+      array = new type[] length;
     }
-    rb += vec4f(coln.(x, y, z, icolf)) * factor;
-  };
+  }
+}
+
+alias DataSet = (Ray[], TraceInfo[], Result[], VMState[]);
+
+DataSet data_threadlocal;
+
+void render(int id) {
+  int (dw, dh) = settings.imgres;
+  
+  alias my-ray-map  = data_threadlocal[0];
+  alias my-info-map = data_threadlocal[1];
+  alias my-res-map  = data_threadlocal[2];
+  alias my-vm-map   = data_threadlocal[3];
+  
+  int from = id * settings.groupsize, to = min(dw * dh, (id+1) * settings.groupsize);
+  int count = to - from;
+  
+  // maps pixel index to morton index
+  auto morton_window = morton_window(dw, dh);
+  
   // split into subfunctions for the benefit of the profiler.
   void setup() {
     auto xstream = vm.fullStream;
-    int resn = settings.results-needed, rayn = settings.rays-needed;
-    // prealloc vm, results, rays
-    if (my-vm-map.length != count) {
-      my-vm-map.free;
-      my-vm-map = new VMState[] (count);
-    }
-    if (my-ray-map.length != count * rayn) {
-      my-ray-map.free;
-      my-ray-map = new Ray[] (count*rayn);
-    }
-    if (my-res-map.length != count * resn) {
-      my-res-map.free;
-      my-res-map = new Result[] (count*resn);
-    }
-    Ray[] ray-slab = my-ray-map;
-    Result[] res-slab = my-res-map;
-    // memset(res-slab.ptr, 0, res-slab.length * size-of Result);
+    int
+      resn  = settings.results-needed,
+      rayn  = settings.rays-needed,
+      infon = settings.info-needed;
+    
+    // prealloc vm, results, rays, infos, callstack
+    resize-to(&my-vm-map, count);
+    resize-to(&my-info-map, count * infon);
+    resize-to(&my-ray-map, count * rayn);
+    resize-to(&my-res-map, count * resn);
+    
+    all_rayplanes = my-ray-map;
+    all_resplanes = my-res-map;
+    all_infoplanes = my-info-map;
+    
+    rayplane_size = count;
+    resplane_size = count;
+    infoplane_size = count;
+    
+    // memset(all_resplanes.ptr, 0, all_resplanes.length * size-of Result);
     // sabotage - enable if you suspect you have misbehaving objects
     // using uninitialized results. Or else just enable the memset above.
-    /*for ref val <- res-slab using val {
+    /*for ref val <- all_resplanes using val {
       // distance = rand();
       // normal = (rand(), rand(), rand());
       // reflective-color = (rand(), rand(), rand());
@@ -206,211 +122,339 @@ void render(int thread, int id, AllThreadsMap ray-res-vm-map, vec4f[] resbuffer)
       success = rand() % 2;
     }*/
     
-    auto state = my-vm-map.ptr;
-    
-    (all_rayplanes, ray-slab) = ray-slab[(0..count * rayn, count * rayn .. $)];
-    (all_resplanes, res-slab) = res-slab[(0..count * resn, count * resn .. $)];
-    rayplane_size = count;
-    resplane_size = count;
     initPlaneMaps;
     
-    int i;
-    auto rayplane = rayplanes[0].ptr;
-    auto stepsz = settings.stepsize;
-    for (int k <- from..to) {
-      if (++i != stepsz) continue;
-      i = 0;
-      int x = k % dw, y = k / dw;
-      coordsf_to_ray(dw, dh, x, y, rayplane);
+    auto state = my-vm-map.ptr;
+    auto rayplane = my-ray-map.ptr;
+    auto infoplane = my-info-map.ptr;
+    for int k <- from..to {
+      // int x = k % dw, y = k / dw;
+      (int x, int y) = morton[morton_window[k]];
+      coordsf_to_ray(dw, dh, vec2f(x, y), rayplane);
+      rayplane ++;
+      
+      infoplane.flags = 3;
+      infoplane ++;
+      
       state.stream = xstream;
       using state {
-        result-id = 0;
-        ray-id = 1;
+        result-id = -1;
+        ray-id = 0;
+        info-id = 0;
+        gid = k;
       }
       state ++;
-      rayplane ++;
     }
   }
   void check() {
-    if (!(mxcsr & (1 << 15))) {
-      writeln "Oops! FTZ has gotten 0. Resetting. $(mxcsr)";
-      // _interrupt 3;
-      // rtz, fz
-      mxcsr |= (3 << 13) | (1 << 15);
-      if (break-on-float-errors)
-        for auto val <- [FE_DIVBYZERO, FE_INVALID/*, FE_OVERFLOW .. infs are fine*/]
-          feenableexcept val;
+    auto state = my-vm-map.ptr;
+    for int k <- from..to {
+      using state {
+        if (result-id != 0) {
+          writeln "$(gid): invalid result-id: $(result-id), expected 0";
+        }
+        if (ray-id != 0) {
+          writeln "$(gid): invalid ray-id: $(ray-id), expected 0";
+        }
+        if (info-id != 0) {
+          writeln "$(gid): invalid info-id: $(info-id), expected 0";
+        }
+      }
+      state ++;
     }
   }
   void process() {
-    check;
+    fp_check;
     auto rayqueue = my-vm-map;
+    CommandHandler step(int from, to) {
+      auto hdl = rayqueue[from].handler;
+      /*for int i <- from..to {
+        if (rayqueue[i].handler !is hdl) {
+          writeln "problem at $from .. $i .. $to: $hdl is not uniform";
+          *int* : 0=0;
+        }
+      }*/
+      // printf("%i: +%i: execute %.*s\n", rayqueue[from].gid, to - from, hdl.toString());
+      hdl.process(rayqueue, from, to);
+      return hdl;
+    }
+    
+    /* Draw a diagram. It helps. */
+    
+    bool retry;
+    void check-catchup(int from, to) {
+      // writeln "start [$from, $to]"; onSuccess writeln "end";
+      int marker = from; // point from which to search for valleys
+      void advance() {
+        // writeln "($from, $to) advance around $marker";
+        alias iptrs = [for i <- ints: int:rayqueue[i].stream.ptr];
+        // find the local minimum valley of iptrs around marker
+        int start = -1, end = to;
+        {
+          // search forward for a deeper valley
+          auto begin = iptrs[marker];
+          for int i <- marker..to {
+            auto cur = iptrs[i];
+            if (cur > begin) { end = i; break; }
+            // no need to worry about hitting the edge; end starts at to
+            if (cur < begin) { start = i; begin = cur; }
+          }
+          // didn't find a valley on the right? search to the left
+          if (start == -1) {
+            start = 0; // assume far left edge
+            for (int i = marker - 1; i >= 0; --i) {
+              auto cur = iptrs[i];
+              if (cur > begin) { start = i + 1; break; } // leading cliffside found
+              if (cur < begin) { end = i + 1; begin = cur; } // fall into a deeper valley
+            }
+          }
+        }
+        // writeln "looking at ($start, $end) around $marker";
+        // start..end is now a local maximum in farthest-back-ness ("valley").
+        // Step it forward until we catch up.
+        while (start > from || end < to) {
+          // writeln "step $start..$end";
+          auto wasCmd = step(start, end);
+          if (wasCmd.irregularStep()) {
+            // hit an irregular cmd
+            // we need to reevaluate all our assumptions :c
+            
+            // writeln "what the heck on $start .. $end: $wasCmd";
+            // guess that our valley is still a valley
+            marker = start;
+            retry = true;
+            return;
+          }
+          
+          // grow backward
+          while (start > from && iptrs[start - 1] == iptrs[start])
+            start --;
+          if (start > from && iptrs[start - 1] < iptrs[start]) {
+            // hit a new valley from the far side
+            // place our expander marker into it
+            // and retry from there
+            marker = start - 1;
+            retry = true;
+            return;
+          }
+          
+          // grow forward
+          while (end < to && iptrs[end - 1] == iptrs[end])
+            end ++;
+          if (end < to && iptrs[end] < iptrs[end - 1]) {
+            // hit a new valley from the near side
+            marker = end;
+            retry = true;
+            return;
+          }
+        } // keep looping until we catch up
+        // once we catch up, go back to doing the whole bundle.
+      }
+      int retrycount;
+      do advance();
+      while retry {
+        retry = false;
+        /*if (retrycount++ > 5000) {
+          writeln "abnormal number of retries: $retrycount";
+          fail;
+        }*/
+      }
+      /*for int i <- from..to-1 if rayqueue[i].handler !is rayqueue[i+1].handler {
+        writeln "$([for thing <- rayqueue[from..to]: *thing.stream.ptr].eval[]) what was the point of that then";
+        _interrupt 3;
+      }*/
+    }
+    // Note: the handlers use i as index into the planes, so we can't do rayqueue = [1..$]
     int base;
     do {
-      // This must proceed backwards! The handlers use i as index into the planes!
-      while (rayqueue.length && !rayqueue[$-1].handler) rayqueue = rayqueue[0 .. $-1];
-      while (base < rayqueue.length && !rayqueue[base].handler) base ++;
+      // do first, to warm up rayqueue
+      while (base < rayqueue.length && !rayqueue[base].handler) {
+        base ++;
+      }
     } while (base < rayqueue.length) {
-      auto hdl = rayqueue[base].stream.ptr;
       int start = base, end = rayqueue.length;
-      /*int num;
-      for auto rq <- rayqueue if int:rq.handler == int:*hdl num++;
-      writeln "$(*hdl): $num out of $(rayqueue.length)";*/
       // writeln "apply $(*hdl): $(rayqueue[base].result-id)";
       
-      hdl.process (rayqueue, start, end);
+      auto hdl = step(start, end);
+      
+      if (hdl.irregularStep() && end - start > 1) {
+        check-catchup(start, end);
+      }
+      
+      // do afterwards, while the end of rayqueue is still warm
+      while (rayqueue.length && !rayqueue[$-1].handler) rayqueue = rayqueue[0 .. $-1];
     }
   }
   setup();
   process();
+  // check();
 }
 
-void renderSceneToScreenDynamic(CommandHandler[] stream) {
-  float ratio = 1;
-  // if (settings.imgres[0]) ratio = settings.imgres.(_0 * 1f / _1);
+void setupResBuffer(vec4f[] resbuffer, void delegate() dg) {
+  int (dw, dh) = settings.imgres;
   
-  (int, int) desired-display-size;
-  // if (settings.(imgres[0] && imgres[1])) desired-display-size = settings.imgres;
-  
-  getScale = λ() -> 2.0f * vec2f(ratio, 1) / vec2f(desired-display-size);
-  
-  vec4f[] resbuffer;
-  auto resbuffer-lock = new ReadWriteLock;
-  
-  auto ray-res-vm-map = new (Ray[], Result[], VMState[])[] settings.threads;
-  
-  auto surf = screen(640, 480, surface => true);
-  desired-display-size = surf.(w, h);
-  
-  resbuffer = new vec4f[] surf.(w * h);
-  resbuffer[] = [for 0..resbuffer.length: vec4f.W];
-  
-  onResize(800, 600);
-  bool stop;
-  
-  auto lp = new LoopPool settings.threads;
-  
-  auto start = sec(), firststart = start;
-  
-  using new ThreadPool 1::
-  addTask delegate void() {
-    auto last-printed = sec();
-    while !stop {
-      resbuffer-lock.lock-read();
-        auto ddsx = desired-display-size[0], ddsy = desired-display-size[1], xgroupsize = settings.xgroupsize;
-        int total = (ddsx * ddsy) / xgroupsize;
-        // writeln "run loop to $total: $ddsx $ddsy $xgroupsize";
+  using scoped recordResultDg {
+    recordResultDg = λ(Ray* rayp, vec3f col, bool isBack, float factor, bool isMetroHit) {
+      (int x, int y) = ray_to_coords(dw, dh, rayp);
+      
+      auto i = y * dw + x;
+      if (i >= dw*dh || i < 0) return;
+      ref rb = resbuffer[i];
+      float icolf = 1;
+      auto coln = col * icolf;
+      // writeln "record @$((x, y)): $(vec4f(coln.(x, y, z, icolf))) for $(col)";
+      // writeln "at $((x, y)), record $(vec4f(coln.(x, y, z, icolf))) for $(col), adding to $(rb)";
+      if (x == dbgPos[0] && y == dbgPos[1]) {
+        writeln "at $((x, y)), record $(vec4f(coln.(x, y, z, icolf))) * $factor for $(col), adding to $(rb)";
+      }
+      rb += vec4f(coln.(x, y, z, icolf)) * factor;
+    };
+    dg();
+  }
+}
+
+platform(default) {
+  void renderSceneToScreenDynamic() {
+    float ratio = 1;
+    // if (settings.imgres[0]) ratio = settings.imgres.(_0 * 1f / _1);
+    
+    vec4f[] resbuffer;
+    auto resbuffer-lock = new ReadWriteLock;
+    
+    auto surf = screen(640, 480, surface => true);
+    settings.imgres = surf.(w, h);
+    
+    resbuffer = new vec4f[] surf.(w * h);
+    resbuffer[] = [for 0..resbuffer.length: vec4f.W * 0.0001];
+    
+    onResize(800, 600);
+    bool stop;
+    
+    auto lp = new LoopPool settings.threads;
+    
+    auto start = sec(), firststart = start;
+    
+    using new ThreadPool 1::
+    addTask delegate void() {
+      auto last-printed = sec();
+      while !stop {
+        resbuffer-lock.lock-read();
+        
+        int (dw, dh) = settings.imgres;
+        int total = (dw * dh) / settings.groupsize;
+        // writeln "run loop to $total: $dw $dh $(settings.groupsize)";
         lp.runLoop(total, delegate void(int id, thr) {
           set-handler (UnrecoverableError uerr) {
             writeln "$(read-pretty-fcc-backtrace())\n$uerr. Aborting. ";
             invoke-exit "exit";
           }
           define-exit "exit" { exit(1); }
-          (dw, dh) = desired-display-size;
-          render(thr, id, ray-res-vm-map, resbuffer);
+          setupResBuffer(resbuffer, λ{
+            render(id);
+          });
         });
-      resbuffer-lock.unlock();
-      iters ++;
-      rays += surf.(w*h);
-      // render();
-      auto delta = float:(sec() - start);
-      auto fulldelta = float:(sec() - firststart);
-      float fps;
-      if (delta > 0) fps = iters / delta;
-      else fps = 0.001; // eps
-      // reconfigure window size to reach target fps
-      import c.math;
-      float pixelfactor = settings.desired-fps / fps, psq = sqrtf pixelfactor;
-      float absf(float f) { if (f < 0) return -f; return f; }
-      if (float:(sec() - last-printed) > 5) {
-        writeln "[fps $fps] [wanted $(settings.desired-fps)] [res $desired-display-size] [speed $(surf.(w*h) * iters / delta / 1_000_000)mrps] [full speed $(double:rays / fulldelta / 1_000_000)mrps]";
-        last-printed = sec();
-      }
-      alias acceptedDelta = 0.5;
-      if (absf (pixelfactor - 1) > acceptedDelta && delta > 1) {
-        if (psq < 0.7) psq = 0.7;
-        (int, int) updated-size = (int:(surf.w / psq), int:(surf.h / psq));
-        updated-size = (updated-size[0] / 10 #* 10, updated-size[1] / 10 #* 10);
-        if (updated-size[0] != desired-display-size[0] && updated-size[1] != desired-display-size[1]) {
-          resbuffer-lock.lock-write();
-            desired-display-size = updated-size;
-            resbuffer.free;
-            resbuffer = new vec4f[] (updated-size[0] * updated-size[1]);
-            resbuffer[] = [for 0..resbuffer.length: vec4f.W * 0.0001]; // so that xyz/w doesn't error
-          resbuffer-lock.unlock();
+        
+        resbuffer-lock.unlock();
+        
+        iters ++;
+        rays += surf.(w*h);
+        // render();
+        auto delta = float:(sec() - start);
+        auto fulldelta = float:(sec() - firststart);
+        float fps;
+        if (delta > 0) fps = iters / delta;
+        else fps = 0.001; // eps
+        // reconfigure window size to reach target fps
+        float pixelfactor = settings.desired-fps / fps, psq = sqrtf pixelfactor;
+        float absf(float f) { if (f < 0) return -f; return f; }
+        if (float:(sec() - last-printed) > 5) {
+          writeln "[fps $fps] [wanted $(settings.desired-fps)] [res $(settings.imgres)] [speed $(surf.(w*h) * iters / delta / 1_000_000)mrps] [full speed $(double:rays / fulldelta / 1_000_000)mrps]";
+          last-printed = sec();
         }
-        // reset estimation
-        iters = 0; start = sec();
+        alias acceptedDelta = 0.5;
+        if (absf (pixelfactor - 1) > acceptedDelta && delta > 1) {
+          if (psq < 0.7) psq = 0.7;
+          (int, int) updated-size = (int:(surf.w / psq), int:(surf.h / psq));
+          updated-size = (updated-size[0] / 10 #* 10, updated-size[1] / 10 #* 10);
+          if (updated-size[0] != settings.imgres[0] && updated-size[1] != settings.imgres[1]) {
+            resbuffer-lock.lock-write();
+              settings.imgres = updated-size;
+              resbuffer.free;
+              resbuffer = new vec4f[] (updated-size[0] * updated-size[1]);
+              resbuffer[] = [for 0..resbuffer.length: vec4f.W * 0.0001]; // so that xyz/w doesn't error
+            resbuffer-lock.unlock();
+          }
+          // reset estimation
+          iters = 0; start = sec();
+        }
       }
     }
-  }
-  set-handler(Error err) {
-    writeln "$err. Exiting. ";
-    invoke-exit "main-return";
-  }
-  define-exit "main-return" {
-    stop = true;
-    waitComplete;
-    return;
-  }
-  auto begin = sec();
-  int tex;
-  glGenTextures(1, &tex);
-  onSuccess glDeleteTextures(1, &tex);
-  while (true) {
-    auto start-draw = sec();
-    resbuffer-lock.lock-read();
-    dw = surf.w; dh = surf.h;
-    scope colors = new vec3f[] (dw*dh);
-    for (int k <- 0..dw*dh) {
-      auto col = resbuffer[k].(xyz/w);
-      float maxf(float a, b) return [a, b][b > a];
-      if (col.(maxf(x, maxf(y, z))) > 1)
-        col /= col.(maxf(x, maxf(y, z)));
-      colors[k] = col;
+    set-handler(Error err) {
+      writeln "$err. Exiting. ";
+      invoke-exit "main-return";
     }
-    resbuffer-lock.unlock();
-    using mode GL {
-      Viewport (0, 0, display.(w, h));
-      MatrixMode PROJECTION;
-      LoadIdentity;
-      MatrixMode MODELVIEW;
-      LoadIdentity;
-      using TEXTURE_2D {
-        Enable;
-        BindTexture tex;
-        TexParameteri(TEXTURE_MIN_FILTER, NEAREST);
-        TexParameteri(TEXTURE_MAG_FILTER, NEAREST);
-        TexImage2D (0, 3, dw, dh, 0, RGBA, FLOAT, colors.ptr);
-      }
-      ClearColor (1, 1, 0, 0);
-      Clear (COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT);
-      
-      using Quads {
-        Vertex2f( 1, -1); TexCoord2f(0, 0);
-        Vertex2f( 1,  1); TexCoord2f(1, 0);
-        Vertex2f(-1,  1); TexCoord2f(1, 1);
-        Vertex2f(-1, -1); TexCoord2f(0, 1);
-      }
+    define-exit "main-return" {
+      stop = true;
+      waitComplete;
+      return;
     }
-    surf.surf.flip;
-    SDL_GL_SwapBuffers();
-    flip;
-    if (mouse-clicked) writeln "click: $(mouse-pos)";
-    auto end-draw = sec();
-    auto should-take = 1f / settings.desired-fps, delta = should-take-end-draw+start-draw /* abusive */;
-    if (should-take > 0)
-      sleep should-take;
-    if (surf.(w != desired-display-size[0] || h != desired-display-size[1])) {
-      surf = screen (desired-display-size, surface => true);
+    auto begin = sec();
+    int tex;
+    glGenTextures(1, &tex);
+    onSuccess glDeleteTextures(1, &tex);
+    while (true) {
+      auto start-draw = sec();
+      resbuffer-lock.lock-read();
+      int (dw, dh) = settings.imgres;
+      scope colors = new vec3f[] (dw*dh);
+      for (int k <- 0..dw*dh) {
+        auto col = resbuffer[k].(xyz/w);
+        float maxf(float a, b) return [a, b][b > a];
+        if (col.(maxf(x, maxf(y, z))) > 1)
+          col /= log10f(col.(maxf(x, maxf(y, z)))) + 1;
+        colors[k] = col;
+      }
+      resbuffer-lock.unlock();
+      using mode GL {
+        Viewport (0, 0, display.(w, h));
+        MatrixMode PROJECTION;
+        LoadIdentity;
+        MatrixMode MODELVIEW;
+        LoadIdentity;
+        using TEXTURE_2D {
+          Enable;
+          BindTexture tex;
+          TexParameteri(TEXTURE_MIN_FILTER, NEAREST);
+          TexParameteri(TEXTURE_MAG_FILTER, NEAREST);
+          TexImage2D (0, 3, dw, dh, 0, RGBA, FLOAT, colors.ptr);
+        }
+        ClearColor (1, 1, 0, 0);
+        Clear (COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT);
+        
+        using Quads {
+          Vertex2f( 1, -1); TexCoord2f(0, 0);
+          Vertex2f( 1,  1); TexCoord2f(1, 0);
+          Vertex2f(-1,  1); TexCoord2f(1, 1);
+          Vertex2f(-1, -1); TexCoord2f(0, 1);
+        }
+      }
+      surf.surf.flip;
+      SDL_GL_SwapBuffers();
+      flip;
+      if (mouse-clicked) writeln "click: $(mouse-pos)";
+      auto end-draw = sec();
+      auto should-take = 1f / settings.desired-fps, delta = should-take-end-draw+start-draw /* abusive */;
+      if (should-take > 0)
+        sleep should-take;
+      if (surf.(w != dw || h != dh)) {
+        surf = screen (dw, dh, surface => true);
+      }
     }
   }
 }
 
-void renderSceneToFile(CommandHandler[] stream) {
+void renderSceneToFile() {
   auto lp = new LoopPool settings.threads;
-  
-  auto ray-res-vm-map = new (Ray[], Result[], VMState[])[] settings.threads;
   
   vec4f[] resbuffer = new vec4f[] (settings.imgres.(_0 * _1));
   // so that xyz/w doesn't error
@@ -419,7 +463,6 @@ void renderSceneToFile(CommandHandler[] stream) {
   auto surf = screen(settings.imgres, surface => true);
   writeln "Calculate $(settings.imgres). ";
   bool done; int parts-done;
-  (dw, dh) = settings.imgres;
   int framenum;
   void save(bool finalCall = false) {
     if (settings.saveFrames && !finalCall) {
@@ -431,37 +474,58 @@ void renderSceneToFile(CommandHandler[] stream) {
               resbuffer);
       framenum ++;
     }
-    saveAs(settings.file, resbuffer, finalCall);
+    saveAs(settings.file, resbuffer);
   }
+  
+  int repeats = 1;
+  if (settings.count) repeats = settings.count;
+  
   (auto up = new ThreadPool 1).addTask delegate void() {
     auto start = sec();
     while !done {
       auto t = sec(), delta = float:(t - start);
       if (parts-done) {
-        int num-parts = (dw * dh) / settings.xgroupsize;
+        int num-parts = (settings.imgres.(_0 * _1) / settings.groupsize) * repeats; // cautiously avoid int overflow
         writeln "$(int:delta)s: $(parts-done * 100 / num-parts)% done, est. $(int:(delta * num-parts / parts-done - delta))s left. ";
       }
       save();
       sleep settings.savestep;
     }
   };
-  int len = settings.imgres.(_0 * _1) / settings.xgroupsize;
+  int len = settings.imgres.(_0 * _1) / settings.groupsize;
   int[] randmap = [for i <- 0..len: i].eval[];
   for int i <- 0..len swap randmap[i], randmap[i..$][rand()%$]; // fisher-yates shuffle
   
-  auto desired-display-size = settings.imgres;
-  lp.runLoop(len, delegate void(int id, thr) {
-    set-handler (UnrecoverableError uerr) {
-      writeln "$(read-pretty-fcc-backtrace())\n$uerr. Aborting. ";
-      asm `int $3`;
-    }
-    (dw, dh) = desired-display-size;
-    render(thr, id/*randmap[id]*/, ray-res-vm-map, resbuffer);
-    parts-done ++;
-  });
+  for 0..repeats {
+    lp.runLoop(len, delegate void(int id, thr) {
+      set-handler (UnrecoverableError uerr) {
+        writeln "$(read-pretty-fcc-backtrace())\n$uerr. Aborting. ";
+        _interrupt 3;
+      }
+      setupResBuffer(resbuffer, λ{ render(id/*randmap[id]*/); });
+      parts-done ++;
+    });
+  }
   done = true;
   up.waitComplete;
   writeln "Save. (processed $c__3, succeeded $c__ - registered $c__2)";
   // writeln "testcount = $testcount";
   save(true);
+}
+
+void configureStream(CommandHandler[] stream) {
+  VMStats stats;
+  stats.addsRay;
+  stats.addsInfo;
+  for auto thing <- stream thing.recordEffect(&stats);
+  stream ~= CommandHandler: null; // terminator
+  vm.fullStream = stream;
+  settings.rays-needed = stats.rays-needed-max;
+  settings.results-needed = stats.results-needed-max;
+  settings.info-needed = stats.info-needed-max;
+  writeln "(ray, res, stat): ($(settings.rays-needed), $(settings.results-needed), $(settings.info-needed)): $(stream[0..$-1].length)";
+  writeln "debug: $(stats.rays-needed-cur), $(stats.results-needed-cur), $(stats.info-needed-cur)";
+  writeln "steps: $(stream.length - 1)";
+  // if (stream.length > 51) writeln "Last 50: $(stream[$-51..$-1])";
+  // else writeln "Stream: $(stream[0..$-1])";
 }

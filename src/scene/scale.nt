@@ -2,69 +2,82 @@ module scene.scale;
 
 import scene.base;
 
-extern(C) void fast_scale_process(Ray**, Result**, VMState*, int numstates, float scale, void* self);
-
 class PostScale : CommandHandler {
   vec3f factor;
   void init(vec3f f) factor = f;
-  void process(VMState[] list, int start, end) {
-    factor.w = 1;
-    for int i <- start .. end {
-      auto sp = &list[i];
-      if (void*:sp.handler == void*:CommandHandler:this)::
-      sp.stream = sp.stream[1..$];
-      
-      using sp mixin(freeRay.replace("!!", "1"));
-      auto res = &resplanes[sp.result-id-1][i];
-      if (res.success) {
-        auto ray = &rayplanes[sp.ray-id-1][i];
-        float f2 = |ray.dir / factor|;
-        if (f2 != 0)
-          res.distance /= f2;
-        // else we're pretty much boned.
+  override {
+    void recordEffect(VMStats* stats) { stats.consumesRay(); }
+    bool irregularStep() { return false; }
+    void process(VMState[] list, int start, end) {
+      factor.w = 1;
+      for int i <- start .. end {
+        ref sp = list[i];
+        
+        if (sp.handler !is CommandHandler:this) fail;
+        sp.stream = sp.stream[1..$];
+        
+        using sp mixin(freeRay.replace("!!", "1"));
+        ref res = resplanes[sp.result-id][i];
+        if (res.success) {
+          ref ray = rayplanes[sp.ray-id][i];
+          float f2 = |ray.dir / factor|;
+          if (f2 != 0) {
+            // printf("adjust %f to %f (f %f)\n", double:res.distance, double:(res.distance/f2), double:f2);
+            res.distance /= f2;
+          } else {
+            // printf("shit.\n");
+          }
+          // else we're pretty much boned.
+        }
+        // TODO adjust normal
       }
     }
   }
 }
 
-class Scale : SceneObject {
+class Scale : CommandHandler {
   vec3f factor;
-  SceneObject sup;
-  void init(vec3f f, SceneObject so) (factor, sup) = (f, so);
-  void init(float f, SceneObject so) (factor, sup) = (vec3f(f), so);
-  bool collide(Ray* ray, Result* res) {
-    Ray ray2 = void;
-    ray2.pos = ray.pos / factor;
-    ray2.dir = ray.dir / factor;
-    auto rescale = |ray2.dir|; ray2.dir /= rescale;
-    if (sup.collide(&ray2, res)) {
-      res.distance *= rescale;
-      return true;
-    } else return false;
-  }
-  void process(VMState[] list, int start, end) {
-    // fast_scale_process(rayplanes.ptr, resplanes.ptr, list.ptr, list.length, factor, void*:CommandHandler:this);
-    // return;
-    factor.w = 1; // oops
-    for int i <- start .. end {
-      auto sp = &list[i];
-      
-      if (void*:sp.handler == void*:CommandHandler:this)::
-      sp.stream = sp.stream[1..$];
-      
-      auto ray = &rayplanes[sp.ray-id-1][i];
-      using sp mixin(allocRay);
-      auto ray2 = &rayplanes[sp.ray-id-1][i];
-      ray2.pos = ray.pos / factor;
-      ray2.dir = ray.dir / factor;
-      float dist = |ray2.dir|;
-      if (dist != 0) ray2.dir /= dist;
+  void init(vec3f f) factor = f;
+  void init(float f) factor = vec3f(f);
+  override {
+    void recordEffect(VMStats* stats) {
+      stats.addsRay();
+    }
+    bool irregularStep() { return false; }
+    void process(VMState[] list, int start, end) {
+      factor.w = 1; // oops
+      for int i <- start .. end {
+        ref sp = list[i];
+        
+        if (sp.handler !is CommandHandler:this) fail;
+        sp.stream = sp.stream[1..$];
+        
+        ref ray = rayplanes[sp.ray-id][i];
+        using sp mixin(allocRay);
+        ref ray2 = rayplanes[sp.ray-id][i];
+        ray2.pos = ray.pos / factor;
+        ray2.dir = ray.dir / factor;
+        float dist = |ray2.dir|;
+        if (dist != 0) ray2.dir /= dist;
+      }
     }
   }
-  CommandHandler[] buildCommandStream(VMStats* stats) {
-    stats.needsRay;
-    auto res = CommandHandler[]:null ~ this ~ sup.buildCommandStream(stats) ~ new PostScale factor;
-    stats.rays-needed-cur --;
-    return res;
-  }
 }
+
+CommandHandler[] buildScale(vec3f factor, CommandHandler[] obj) {
+  CommandHandler[auto~] res;
+  res ~= new Scale(factor);
+  res ~= obj;
+  res ~= new PostScale(factor);
+  return res[];
+}
+
+class PreScale : PreHandler {
+  vec3f factor;
+  PreHandler sub;
+  void init(vec3f factor, PreHandler sub) this.(factor, sub) = (factor, sub);
+  override void iterate(void delegate(PreHandler) dg) { dg sub; }
+  override CommandHandler[] flatten() { return buildScale(factor, scope= sub.flatten()); }
+}
+
+PreHandler mkScale(vec3f factor, PreHandler sub) { return new PreScale(factor, sub); }

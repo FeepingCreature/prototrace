@@ -1,0 +1,860 @@
+module graphing;
+
+import std.(random, thread, string, math, time, lib.(glfw3, opengl.(, window)), macros.where);
+pragma(define, "_GNU_SOURCE");
+import c.fenv;
+
+alias eps = 0.0001;
+
+float randf() { return std.random.base.randf(deflt); }
+
+struct Ray {
+  vec3f pos, dir;
+  vec3f at(float f) { return pos + f * dir; }
+  alias toString = "Ray [$pos |-> $dir]";
+}
+
+alias verybigfloat = float.infinity;
+// alias verybigfloat = float.max;
+
+int blocksize = 800 * 60;
+
+template iterate(T) {
+  struct ArrayIterator {
+    T array;
+    int offset;
+    int length;
+    alias advance = ++offset < length;
+    alias value = array[offset];
+    auto opIndex(int i) { return array[offset + i + 1]; }
+    ArrayIterator slice(int from, to) {
+      assert(0 <= from <= to <= length);
+      return ArrayIterator:(array, offset + from, to - from);
+    }
+  }
+  ArrayIterator iterate(T t) {
+    return ArrayIterator:(t, -1, t.length);
+  }
+}
+
+final class ResultSet {
+  int length;
+  vec3f* diffuse, emissive, normal;
+  float* distance;
+  bool* fromInside;
+  void init(int sz) {
+    length = sz;
+    diffuse = new vec3f[] sz #.ptr; emissive = new vec3f[] sz #.ptr;
+    normal = new vec3f[] sz #.ptr;
+    distance = new float[] sz #.ptr;
+    fromInside = new bool[] sz #.ptr;
+  }
+  ResultAccessor opIndex(int i) {
+    return ResultAccessor:(this, i);
+  }
+  void clear() {
+    for int i <- 0..length distance[i] = verybigfloat;
+  }
+  void hit(float distance = verybigfloat, bool fromInside = false) {
+    for int i <- 0..length this[i].hit(distance, fromInside);
+  }
+}
+
+final class Material {
+  vec3f emissive, diffuse;
+  void init(vec3f emissive = vec3f(0), diffuse = vec3f(0)) { this.(emissive, diffuse) = (emissive, diffuse); }
+  string toString() { return "Material [color $diffuse, emit $emissive]"; }
+  void set(ResultAccessor ra) {
+    ra.emissive = emissive;
+    ra.diffuse = diffuse;
+  }
+}
+
+struct ResultAccessor {
+  ResultSet mine;
+  int offset;
+  alias diffuse = mine.diffuse[offset], emissive = mine.emissive[offset];
+  alias normal = mine.normal[offset];
+  alias distance = mine.distance[offset];
+  alias fromInside = mine.fromInside[offset];
+  alias tuple = (diffuse, emissive, normal, distance, fromInside);
+  void clear() {
+    // "no object" ==
+    // "hit something or maybe not, in any case it's an infinite distance away"
+    distance = verybigfloat;
+  }
+  void hit(float distance = verybigfloat, bool fromInside = false, Material mat = null, vec3f* normal = null) {
+    if (distance > this.distance) return; // painter's algorithm
+    hitOverwrite(distance, fromInside, mat, normal);
+  }
+  void hitOverwrite(float distance = verybigfloat, bool fromInside = false, Material mat = null, vec3f* normal = null) {
+    this.fromInside = fromInside;
+    this.distance = distance; // keep this in cache, definitely
+    if (mat) mat.set(this);
+    if (normal) this.normal = *normal;
+  }
+  void copyfrom(ResultAccessor other) {
+    tuple = other.tuple;
+  }
+}
+
+ResultSet[auto~] results_freelist;
+ResultSet allocResults(int size) {
+  ref rf = results_freelist;
+  if (rf.length) {
+    auto res = rf.popEnd();
+    assert(res.length == size);
+    return res;
+  }
+  return new ResultSet size;
+}
+void freeResults(ResultSet ress) {
+  // ress.free;
+  results_freelist ~= ress;
+}
+
+Ray[][auto~] rays_freelist;
+Ray[] allocRays(int size) {
+  ref rf = rays_freelist;
+  if (rf.length) {
+    auto res = rf.popEnd();
+    assert(res.length == size);
+    return res;
+  }
+  return new Ray[] size;
+}
+void freeRays(Ray[] rays) {
+  // rays.free;
+  rays_freelist ~= rays;
+}
+
+/**
+  consumes: state must be present at entry, and is consumed.
+    Example: group consumes 1x results
+  requires: state must be present at entry, but is not (necessarily) consumed
+    Example: sphere requires 1x rays
+    consumes entails requires.
+  provides: state is added by the command
+    Example: allocemptyresults provides 1x results
+**/
+abstract class SceneCommand {
+  void calcBuffers(Buffer[] inputs, Buffer[] outputs);
+}
+
+abstract class Buffer {
+  int length;
+  int fillLevel;
+  bool frozen;
+  string name;
+  string toString() { return name; }
+  alias filling = !frozen;
+  int ibs();
+  int obs();
+  void written(int len) {
+    assert(!frozen, "wrote to a buffer that was frozen");
+    fillLevel += len;
+    assert(fillLevel <= length, "overfilled buffer");
+  }
+  void clear() {
+    assert(frozen, "cleared a filling buffer");
+    fillLevel = 0;
+    frozen = false; // reenable
+  }
+}
+
+final class RayBuffer : Buffer {
+  Ray[] rays_backing;
+  alias write = rays_backing[fillLevel .. length];
+  alias read = rays_backing[0 .. fillLevel];
+  void init(Ray[] rays_backing, string name) { this.rays_backing = rays_backing; length = rays_backing.length; this.name = name; }
+  override int ibs() { return read.length; }
+  override int obs() { return write.length; }
+  override void free() { freeRays rays_backing; super.free(); }
+}
+
+final class ResBuffer : Buffer {
+  ResultSet results_backing;
+  alias write = iterate(results_backing).slice(fillLevel, length);
+  alias read = iterate(results_backing).slice(0, fillLevel);
+  void init(ResultSet results, string name) { this.results_backing = results; length = results.length; this.name = name; }
+  override int ibs() { return read.length; }
+  override int obs() { return write.length; }
+  override void clear() {
+    super.clear();
+    results_backing.clear();
+  }
+  override void free() { freeResults results_backing; super.free(); }
+}
+
+int raybufcount, resbufcount;
+Buffer allocRayBuf() { return new RayBuffer (allocRays blocksize, "R$(raybufcount++)"); }
+Buffer allocResBuf() {
+  auto res = new ResBuffer (allocResults blocksize, "H$(resbufcount++)");
+  res.results_backing.clear;
+  return res;
+}
+
+template unpack(T) {
+  T unpack(Buffer[] bufs) {
+    T res;
+    static if (type-is tuple T) {
+      if (res.length != bufs.length) raise new Error "Insufficient buffers for unpack!$(string-of T) - got $(bufs.length), expected $(res.length)";
+      static if (res.length) {
+        static for int i <- 0..res.length {
+          res[i] = type-of res[i]: bufs[i];
+          if (!res[i]) raise new Error "Invalid argument for unpack!$(string-of T): got $(bufs[i]), expected $(string-of type-of res[i]) = $(string-of T)[$i]";
+        }
+      } else {
+        return ();
+      }
+    } else {
+      if (bufs.length != 1) raise new Error "Insufficient buffers for unpack!$(string-of T) - got $(bufs.length), expected 1";
+      res = type-of res: bufs[0];
+      if (!res) raise new Error "Invalid argument for unpack!$(string-of T): got $(bufs[0]), expected $(string-of T)";
+    }
+    return res;
+  }
+}
+
+template pack(T) {
+  Buffer[] pack(T t) {
+    Buffer[auto~] res;
+    static if (type-is tuple T) {
+      static for int i <- 0..res.length {
+        res ~= .pack t[i];
+      }
+    } else {
+      static if (types-equal(T, ResultSet)) {
+        res ~= new ResBuffer t;
+      } else {
+        static if (types-equal(T, Ray[])) {
+          res ~= new RayBuffer t;
+        } else {
+          pragma(fail, "Unknown type: $(string-of T), cannot pack");
+        }
+      }
+    }
+    return res[];
+  }
+}
+
+class Plane : SceneCommand {
+  vec3f normal, offset;
+  Material mat;
+  void init(vec3f n, o, Material m) {
+    (normal, offset, mat) = (n,o,m);
+  }
+  override void calcBuffers(Buffer[] inputs, outputs) {
+    pragma(fast);
+    
+    auto raybuf = unpack!RayBuffer inputs, resbuf = unpack!ResBuffer outputs;
+    
+    assert(raybuf.frozen); assert(!resbuf.frozen);
+    onSuccess resbuf.written raybuf.ibs;
+    
+    for ref ray <- raybuf.read && auto res <- resbuf.write {
+      alias pos = ray.pos, dir = ray.dir;
+      
+      auto denom = -(dir * normal).sum;
+      
+      float predist = (normal * (pos - offset)).sum;
+      if (denom * predist > 0) { // if a*b > 0, then a/b also > 0
+        // if (res.distance < newDistance) continue;
+        // if (res.distance < predist / denom) continue;
+        // if (res.distance * denom < predist) continue;
+        if (res.distance * abs(denom) < abs(predist)) continue;
+        res.hitOverwrite( // already did distance test
+          distance => predist / denom,
+          fromInside => denom < 0,
+          normal => &normal,
+          mat
+        );
+      } else if (denom > 0) { // ray on inside of halfspace "exits at infinity"
+        res.hit(fromInside => true);
+      }
+    }
+  }
+}
+
+class Sphere : SceneCommand {
+  vec3f center;
+  float radius, rsq, invr;
+  Material mat;
+  void init(vec3f c, float r, Material material) {
+    center = c;
+    radius = r;
+    mat = material;
+    rsq = radius * radius;
+    invr = 1 / radius;
+  }
+  override void calcBuffers(Buffer[] inputs, Buffer[] outputs) {
+    pragma(fast);
+    
+    auto raybuf = unpack!RayBuffer inputs, resbuf = unpack!ResBuffer outputs;
+    auto rsq = rsq, center = center, invr = invr;
+    
+    assert(raybuf.frozen); assert(!resbuf.frozen);
+    onSuccess resbuf.written raybuf.ibs;
+    
+    for ref ray <- raybuf.read && auto res <- resbuf.write {
+      vec3f pos = ray.pos;
+      alias dir = ray.dir;
+      
+      pos -= center; // pretranslate so we can pretend that we're a sphere around the origin
+      
+      // algorithm 1
+      /*float k = -(dir * pos).sum / (dir*dir).sum;
+      auto p = pos + dir * k, ps = (p*p).sum;
+      if (ps > rsq) continue;
+      
+      auto sq = sqrtf (rsq - ps);
+      auto k1 = k + sq, k2 = k - sq;*/
+      
+      // algorithm 2
+      float p = (2 * pos * dir).sum;
+      
+      float inside = (p*p*(1f/4) + rsq) - (pos*pos).sum;
+      if (inside < 0) continue;
+      float sq = sqrt inside,
+        k = -p/2,
+        k1 = k - sq,
+        k2 = k + sq;
+      
+      // common
+      if (k2 > 0) {
+        
+        // if the only hit we could get was k2, ie. k1 !> 0,
+        // then it was a hit from the inside.
+        // writeln "$ray hits $this at $([k2, k1][k1 > 0])";
+        
+        float distance = [k2, k1][k1 > 0];
+        if (distance !< res.distance) continue;
+        
+        vec3f normal = pos + dir * distance; // sphere around the origin, remember
+        normal *= invr;
+        
+        res.hitOverwrite (
+          distance => distance,
+          fromInside => k1 !> 0,
+          normal => &normal,
+          mat
+        );
+      }
+    }
+  }
+}
+
+class Group : SceneCommand {
+  void init() { }
+  override void calcBuffers(Buffer[] inputs, Buffer[] outputs) {
+    pragma(fast);
+    
+    auto resbuf = unpack!ResBuffer outputs;
+    scope inputs_rb = [for buf <- inputs: (ResBuffer:buf).read].eval[];
+    
+    int i;
+    onSuccess resbuf.written i;
+    for i <- ints && auto target <- resbuf.write {
+      int nearest; float nearest_dist = inputs_rb[0][i].distance;
+      for auto inp <- inputs_rb && int j <- ints {
+        if (inp[i].distance < nearest_dist) {
+          nearest_dist = inp[i].distance;
+          nearest = j;
+        }
+      }
+      target.copyfrom inputs_rb[nearest][i];
+    }
+  }
+}
+
+shared float fov, projscale;
+
+interface Source {
+  int available();
+}
+
+interface Sink {
+  int available();
+}
+
+class RaySource : SceneCommand, Source {
+  int w, h;
+  int x, y;
+  void init(int w, h) { this.(w, h) = (w, h); }
+  override int available() {
+    auto id = y * w + x;
+    auto total = w * h;
+    auto left = total - id;
+    return min(blocksize, left);
+  }
+  override void calcBuffers(Buffer[] inputs, outputs) {
+    pragma(fast);
+    
+    unpack!() inputs;
+    auto rays = unpack!RayBuffer outputs;
+    assert(!rays.frozen);
+    auto raywrite = rays.write;
+    
+    float ratio = w * 1f / h;
+    float invw = 1f / (w / 2f), invh = 1f / (h / 2f);
+    vec3f startpos = vec3f(0, 2, -projscale / fov);
+    
+    int id;
+    onSuccess rays.written id;
+    while (y < h) {
+      while (x < w) {
+        if (id == raywrite.length) return;
+        
+        float fx = 1 - (x + randf()) * invw,
+              fy = (y + randf()) * invh - 1;
+        
+        fx *= ratio * fov;
+        fy *= fov;
+        
+        ref ray = raywrite[id++];
+        ray.pos = startpos;
+        ray.dir = vec3f(fx, fy, 1).normalized;
+        x++;
+      }
+      x = 0;
+      y++;
+    }
+  }
+}
+
+class WriteRays : SceneCommand, Sink {
+  vec4f[] resbuffer;
+  int id;
+  void init(vec4f[] resbuffer) { this.resbuffer = resbuffer; }
+  override int available() {
+    return blocksize; // not gonna get more than input anyways
+  }
+  override void calcBuffers(Buffer[] inputs, Buffer[] outputs) {
+    pragma(fast);
+    
+    ResBuffer results = unpack!ResBuffer inputs;
+    unpack!() outputs;
+    
+    assert(results.frozen);
+    
+    for auto res <- results.read {
+      auto col = vec4f: res.emissive;
+      if (res.distance == verybigfloat) col = vec3f(1, res.fromInside, 0);
+      ref rb = resbuffer[id++];
+      col.w = 1;
+      rb += col;
+    }
+  }
+}
+
+class Node {
+  SceneCommand obj;
+  Buffer[] inbuffers, outbuffers;
+  bool done;
+  void init(SceneCommand obj, Buffer[] inbuffers, outbuffers) {
+    this.(obj, inbuffers, outbuffers) = (obj, inbuffers, outbuffers);
+  }
+  int uibs() {
+    if (done) return 0;
+    if (!inbuffers.length) return (Source:obj).available();
+    auto first_ibs = inbuffers[0].ibs();
+    for auto ib <- inbuffers if (ib.ibs() != first_ibs) return 0;
+    return first_ibs;
+  }
+  int uobs() {
+    if (!outbuffers.length) return (Sink:obj).available();
+    int sub_obs(Buffer outbuf) { if (outbuf.frozen) return 0; return outbuf.obs(); }
+    int res = sub_obs outbuffers[0];
+    for auto ob <- outbuffers[1..$] res = res.min sub_obs ob;
+    return res;
+  }
+  int workload() {
+    auto i = uibs(), o = uobs();
+    if (i <= o) return i;
+    return 0;
+  }
+}
+
+void delegate(void delegate()) per(float f) {
+  auto t = sec();
+  return new λ(void delegate() dg) {
+    auto s = sec();
+    while (s - t >= f) {
+      t += f;
+      dg();
+    }
+  }
+}
+
+float timeit(void delegate() dg) {
+  auto start = sec();
+  dg();
+  auto end = sec();
+  return float:(end - start);
+}
+
+void calc(int w, h, vec4f[] resbuffer) {
+  // reset
+  raybufcount = 1;
+  resbufcount = 1;
+  
+  (Buffer, int[auto~])[auto~] inbuffer_maps;
+  Node[auto~] nodes;
+  void addNode(SceneCommand cmd, Buffer[] inbs, outbs) {
+    int i = nodes.length;
+    nodes ~= new Node (cmd, inbs, outbs);
+    
+    for auto inb <- inbs {
+      for ref pair <- inbuffer_maps {
+        if pair[0] is inb { pair[1] ~= i; break; }
+      } then inbuffer_maps ~= (inb, [i].dup);
+    }
+  }
+  Buffer raysource() {
+    SceneCommand rs = new RaySource(w, h);
+    addNode (rs, null, [auto rb = allocRayBuf()].dup);
+    return rb;
+  }
+  void raysink(Buffer res) {
+    SceneCommand rs = new WriteRays(resbuffer);
+    addNode (rs, [res].dup, null);
+  }
+  Buffer sphere(vec3f pos, float radius, Material mat, Buffer rays) {
+    SceneCommand sph = new Sphere(pos, radius, mat);
+    addNode (sph, [rays].dup, [auto rb = allocResBuf()].dup);
+    return rb;
+  }
+  Buffer plane(vec3f normal, vec3f offset, Material mat, Buffer rays) {
+    SceneCommand pln = new Plane(normal, offset, mat);
+    addNode (pln, [rays].dup, [auto rb = allocResBuf()].dup);
+    return rb;
+  }
+  Buffer group(Buffer[] inputs) {
+    SceneCommand grp = new Group;
+    addNode (grp, inputs.dup, [auto rb = allocResBuf()].dup);
+    return rb;
+  }
+  Buffer pt_bounce(Buffer hit, rays) {
+    SceneCommand bnc = new MakeBounceRay(hit, rays);
+    addNode (bnc, [hit, rays].dup, [auto rb = allocRayBuf()].dup);
+    return rb;
+  }
+  Buffer pt_merge(Buffer first_hit, next_hit) {
+    SceneCommand mrg = new MergeBounce(first_hit, next_hit);
+    addNode (mrg, [first_hit, next_hit].dup, [auto rb = allocResBuf()].dup);
+    return rb;
+  }
+  Buffer scene(Buffer rays) {
+    return group [
+      sphere(vec3f(0, 0, 3), 1f, new Material (diffuse => vec3f(0.6, 0.6, 0.6), emissive => vec3f(0.5, 0, 0)), rays),
+      plane(vec3f.Y, vec3f(0), new Material (diffuse => vec3f(0.5, 0.5, 0.5)), rays),
+      plane(-vec3f.Y, vec3f.Y * 100, new Material (emissive => vec3f(1, 1, 1), diffuse => vec3f(0, 0, 0)), rays)
+    ];
+  }
+  Buffer pathtrace(Buffer delegate(Buffer) scene, int depth, Buffer rays) {
+    auto hit = scene rays;
+    if (depth) {
+      auto bnc = pt_bounce(hit, rays);
+      auto subscene = pathtrace(&scene, depth - 1, bnc);
+      hit = pt_merge(hit, subscene);
+    }
+    return hit;
+  }
+  raysink pathtrace(&scene, 0, raysource);
+  // nodegraph get
+  while (true) {
+    void writeln(string s) { .writeln "[sched] $s"; }
+    // void writeln(string s) { }
+    
+    bool loop;
+    for ref pair <- inbuffer_maps {
+      if (!pair[0].frozen) continue;
+      for auto i <- pair[1] if !nodes[i].done break;
+      then {// all this buffer's nodes are done
+        writeln scope= "clear buffer $(pair[0]) because all nodes are done";
+        pair[0].clear; // so clear it
+        loop = true;
+      }
+    }
+    for auto node <- nodes {
+      if (!node.done) continue;
+      for auto inb <- node.inbuffers {
+        if (inb.frozen) break;
+      } then { // all inputs are unfrozen
+        writeln "reset node $(node.obj) because fresh input is available";
+        node.done = false; // got fresh data
+        loop = true;
+      }
+    }
+    if (loop) continue;
+    
+    int maxWorkload = 1, maxWorkloadId = -1;
+    for auto node <- nodes && auto i <- ints {
+      auto wl = node.workload();
+      if (wl >= maxWorkload) {
+        maxWorkload = wl;
+        maxWorkloadId = i;
+      }
+    }
+    if (maxWorkloadId == -1) {
+      writeln "no workload available, validating all buffers empty, then exit";
+      for auto node <- nodes {
+        for auto inb <- node.inbuffers {
+          if (auto ibs = inb.ibs()) {
+            writeln scope= "buffer $inb still has data to process";
+            fail;
+          }
+        }
+      }
+      for auto pair <- inbuffer_maps 
+        pair[0].free;
+      return;
+    }
+    auto node = nodes[maxWorkloadId];
+    assert(!node.done);
+    for auto input <- node.inbuffers {
+      if (!input.frozen) {
+        input.frozen = true;
+        writeln scope= "froze input $input";
+      }
+    }
+    for auto output <- node.outbuffers {
+      if (output.frozen) {
+        writeln "output was frozen, cannot write, wtf";
+        fail;
+      }
+    }
+    writeln scope= " calc $(node.obj) with $maxWorkload from $(node.inbuffers) to $(node.outbuffers)";
+    node.obj.calcBuffers(node.inbuffers, node.outbuffers);
+    node.done = true;
+  }
+}
+
+void renderToScreen(SceneCommand[] cmdlist) {
+  using new GLFWWindow {
+    setup(800, 600);
+    glwindow = that;
+  }
+  
+  float ratio = 1;
+  
+  int tex;
+  glGenTextures(1, &tex);
+  onSuccess glDeleteTextures(1, &tex);
+  
+  int w = 800, h = 600;
+  
+  scope vec4f[] resbuffer = new vec4f[] (w * h);
+  
+  long iters;
+  float intime;
+  auto onceperframe = per(1);
+  
+  /*
+  alias numThreads = 4;
+  
+  auto tp = new ThreadPool numThreads;
+  for int threadId <- 0..numThreads {
+    ref intime = intime;
+    ref iters = iters;
+    tp.addTask new λ{
+      deflt = getPRNG(threadId);
+      while (true) {
+        intime += timeit λ calcCommands(w, h, cmdlist, resbuffer);
+        iters += w * h;
+      }
+    }
+  }*/
+  
+  
+  while (true) {
+    // if (intime < 0.001) { sleep(0.1); continue; } // wait for first calc
+    intime += timeit λ calc (w, h, resbuffer);
+    iters += w * h;
+    
+    onceperframe λ { writeln "$(double:iters / intime) ips, $iters total"; };
+    
+    scope colors = new vec3f[] (w * h);
+    for (int k <- 0 .. w*h) {
+      auto col = resbuffer[k].(xyz/w);
+      float maxf(float a, b) return [a, b][b > a];
+      if (col.(maxf(x, maxf(y, z))) > 1)
+        col /= col.(maxf(x, maxf(y, z)));
+      colors[k] = col;
+    }
+    using mode GL {
+      Viewport (0, 0, glwindow.size());
+      MatrixMode PROJECTION; LoadIdentity;
+      MatrixMode MODELVIEW;  LoadIdentity;
+      using TEXTURE_2D {
+        Enable;
+        BindTexture tex;
+        TexParameteri(TEXTURE_MIN_FILTER, NEAREST);
+        TexParameteri(TEXTURE_MAG_FILTER, NEAREST);
+        TexImage2D (0, 3, w, h, 0, RGBA, FLOAT, colors.ptr);
+      }
+      ClearColor (1, 1, 0, 0);
+      Clear (COLOR_BUFFER_BIT | DEPTH_BUFFER_BIT);
+      
+      using Quads {
+        Vertex2f(-1,  1); TexCoord2f(0, 0);
+        Vertex2f(-1, -1); TexCoord2f(1, 0);
+        Vertex2f( 1, -1); TexCoord2f(1, 1);
+        Vertex2f( 1,  1); TexCoord2f(0, 1);
+      }
+    }
+    glwindow.update;
+  }
+}
+
+/*
+void renderBench(SceneCommand[] cmdlist) {
+  int w = 1920, h = 1080;
+  w *= 2; h *= 2;
+  scope vec4f[] resbuffer = new vec4f[] (w * h);
+  
+  auto t = timeit λ calcCommands(w, h, cmdlist, resbuffer);;
+  writeln "$(double:(w * h) / t) ips ($(w * h) iters)";
+}
+*/
+
+vec3f rand_halfsphere(vec3f around) {
+  auto v = vec3f(randf() * 2 - 1, randf() * 2 - 1, randf() * 2 - 1).normalized;
+  if ((v * around).sum < 0) return -v;
+  return v;
+}
+
+class MakeBounceRay : SceneCommand {
+  override void calcBuffers(Buffer[] inputs, outputs) {
+    pragma(fast);
+    
+    (ResBuffer prevhits, RayBuffer prevrays) = unpack!(ResBuffer, RayBuffer) inputs;
+    assert(prevhits.frozen && prevrays.frozen);
+    
+    RayBuffer newrays = unpack!RayBuffer outputs;
+    assert(!newrays.frozen);
+    
+    int count;
+    onSuccess newrays.written count;
+    
+    for ref ray <- prevrays && auto res <- iterate(prevhits) {
+      // if you change it, change it in MergeBounce too!
+      if (res.distance == verybigfloat) continue;
+      if (res.diffuse == vec3f(0)) continue; // no point, nothing reflected
+      
+      ref newray = newrays[count++];
+      auto normal = res.normal;
+      // bounce randomly
+      auto newdir = rand_halfsphere(normal);
+      newray = Ray:(ray.at res.distance + normal * eps, newdir);
+    }
+  }
+}
+
+class MergeBounce : SceneCommand {
+  override void calcBuffers(Buffer[] inputs, outputs) {
+    pragma(fast);
+    
+    ResBuffer (firsthit, nexthit) = unpack!(ResBuffer, ResBuffer)(inputs);
+    ResBuffer merged = unpack!ResBuffer outputs;
+    
+    int i, k;
+    for auto hit1 <- firsthit.read {
+      ref target = 
+    }
+    
+    auto bouncedrays = state.rays   .popEnd();
+    auto bouncedres  = state.results.popEnd();
+    onSuccess { state.freeRays bouncedrays; state.freeResults bouncedres; }
+    int count;
+    
+    for auto res <- iterate(state.results.top()) {
+      // duplicate the check from above, to assign our bounce rays to the right result
+      if (res.distance == verybigfloat) continue;
+      if (res.diffuse == vec3f(0)) continue;
+      
+      auto newres = bouncedres[count++];
+      res.emissive += res.diffuse * newres.emissive;
+    }
+  }
+}
+
+/*
+void validate(string context, SceneCommand[] cmds) {
+  int rays, results;
+  rays = 1;
+  results = 0;
+  void fail(string s) {
+    .fail "[$context] $s";
+  }
+  for auto cmd <- cmds {
+    // check requires
+    if (rays    < cmd.requires.rays   )
+      fail "requires $(cmd.requires.rays      ) rays but only $(rays      ) rays available";
+    if (results < cmd.requires.results)
+      fail "requires $(cmd.requires.results) results but only $(results) results available";
+    // check consumes
+    if (rays    < cmd.consumes.rays   )
+      fail "consumes $(cmd.consumes.rays      ) rays but only $(rays      ) rays available";
+    if (results < cmd.consumes.results)
+      fail "consumes $(cmd.consumes.results) results but only $(results) results available";
+    
+    if (cmd.consumes.rays > cmd.requires.rays)
+      fail "consumes $(cmd.consumes.rays) rays but did not mark them as required";
+    if (cmd.consumes.results > cmd.requires.results)
+      fail "consumes $(cmd.consumes.results) results but did not mark them as required";
+    
+    rays -= cmd.consumes.rays;
+    rays += cmd.provides.rays;
+    
+    results -= cmd.consumes.results;
+    results += cmd.provides.results;
+  }
+  if (rays != 1) fail "command stream ended but $rays rays left (expected 1)";
+  if (results != 1) fail "command stream ended but $results results found (expected 1)";
+}
+*/
+
+void main(string[] args) {
+  fov = 0.75;
+  projscale = 1;
+  blocksize = 60000;
+  
+  set-handler (UnrecoverableError uerr) {
+    import std.process;
+    writeln $ "Backtrace:
+$(read-pretty-fcc-backtrace())
+  -----
+$uerr";
+    invoke-exit "return";
+  }
+  define-exit "return" return;
+  
+  for auto val <- [FE_DIVBYZERO, FE_INVALID, FE_OVERFLOW /* infs are fine on sse */]
+    feenableexcept val;
+  
+  /*SceneCommand[auto~] cmds;
+  
+  cmds ~= new AllocEmptyResult;
+  cmds ~= new Plane(vec3f.Y, vec3f(0),       new Material (diffuse  => vec3f(0.6, 0.6, 0.6)));
+  cmds ~= new Plane(-vec3f.X, vec3f.X * 10,  new Material (emissive => vec3f(  1,   1,   1)));
+  cmds ~= new Plane(vec3f.X, -vec3f.X * 10,  new Material (diffuse  => vec3f(0.6, 0.6, 0.6)));
+  cmds ~= new Plane(-vec3f.Y, vec3f.Y * 10,  new Material (diffuse  => vec3f(0.6, 0.6, 0.6)));
+  cmds ~= new Plane(-vec3f.Z, vec3f.Z * 30,  new Material (diffuse  => vec3f(0.9, 0.5, 0.5)));
+  for int x <- 0..3 for int y <- 0..3 {
+    cmds ~= new Sphere(vec3f(x - 1, 0, y + 1.5), 0.5,      new Material (diffuse  => vec3f(0.6 * x / 2f + 0.4, 0.6 * y / 2f + 0.4, 0.5f)));
+  }
+  
+  auto world = cmds[]; cmds.clear;
+  validate("stage 1", world);
+  cmds ~= mkIndirectLighting (world, 10);
+  
+  // auto litworld = cmds[]; cmds.clear;
+  // validate("stage 2", litworld);
+  
+  validate("final", cmds[]);
+  
+  writeln "render $(cmds.length) command stream";*/
+  renderToScreen(null);
+  // renderBench(null);
+}

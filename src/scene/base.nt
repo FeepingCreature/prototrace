@@ -7,24 +7,34 @@ public import std.math;
 struct VMStats {
   int results-needed-max, results-needed-cur;
   int rays-needed-max, rays-needed-cur;
+  int info-needed-max, info-needed-cur;
   void addsResults(int num) { results-needed-cur += num; recordHighPoint; }
   void addsRays(int num) { rays-needed-cur += num; recordHighPoint; }
+  void addsInfos(int num) { info-needed-cur += num; recordHighPoint; }
   void addsResult() addsResults 1;
   void addsRay() addsRays 1;
+  void addsInfo() addsInfos 1;
   void consumesResult() { results-needed-cur --; }
   void consumesRay() { rays-needed-cur --; }
+  void consumesInfo() { info-needed-cur --; }
   void recordHighPoint() {
-    if (rays-needed-cur > rays-needed-max) rays-needed-max = rays-needed-cur;
+    if (   rays-needed-cur >    rays-needed-max)    rays-needed-max =    rays-needed-cur;
     if (results-needed-cur > results-needed-max) results-needed-max = results-needed-cur;
+    if (   info-needed-cur >    info-needed-max)    info-needed-max =    info-needed-cur;
   }
 }
 
 interface CommandHandler {
   void process(VMState[] list, int start, end);
   void recordEffect(VMStats* stats);
+  // return false here if all matching rays are advanced **no more than** 1.
+  // return true if you skip forwards, basically.
+  // NOTE: skipping BACKWARDS is entirely allowed! this is because we use this to
+  // "catch up" to the wave in render.check-catchup, and a valley skipping backwards
+  // is still a valley.
+  bool irregularStep();
 }
 
 abstract class SceneObject {
-  bool collide(Ray*, Result*) { assert(false, "$this::collide not implemented"); }
   CommandHandler[] buildCommandStream() { assert(false, "$this::buildCommandStream not implemented"); }
 }

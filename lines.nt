@@ -1,0 +1,50 @@
+module lines;
+
+import std.string, std.socket;
+
+class ReaderError : SocketError {
+  void init(string s) { super.init s; }
+}
+
+class LineReader {
+  Iterator!string lines;
+  string last_line;
+  string verbose;
+  void setVerbose(bool state) {
+    if (state) verbose = "";
+    else verbose = null;
+  }
+  void get_line() {
+    if (!last_line) {
+      if (auto line <- lines) {
+        if (verbose) {
+          if (verbose.length) writeln scope= "[$verbose] < $line";
+          else writeln scope= "< $line";
+        }
+        last_line = line; 
+      }
+    }
+    if (!last_line.length) raise new ReaderError "expected line, but connection was closed";
+  }
+  void expect(string s) {
+    get_line;
+    if (last_line != s) raise new ReaderError "Expected '$s', got '$last_line'";
+    last_line = null;
+  }
+  string accept(string s) {
+    get_line;
+    if (last_line == s) {
+      last_line = null;
+      return s;
+    }
+    return null;
+  }
+  string startsWith(string s) {
+    get_line;
+    if (auto rest = .startsWith(last_line, s)) {
+      last_line = null;
+      return rest;
+    }
+    return null;
+  }
+}

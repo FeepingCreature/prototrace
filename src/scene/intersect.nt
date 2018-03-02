@@ -1,0 +1,284 @@
+module scene.intersect;
+
+import scene.base, scene.util;
+
+class PreIntersect : PreHandler {
+  PreHandler a, b;
+  void init(PreHandler a, b) this.(a, b) = (a, b);
+  override void iterate(void delegate(PreHandler) dg) { dg a; dg b; }
+  override CommandHandler[] flatten() {
+    return buildIntersect(scope= a.flatten(), scope= b.flatten());
+  }
+}
+
+PreHandler mkIntersect(PreHandler a, b) {
+  // U ∩ X = X
+  // X ∩ U = X
+  if ((auto ca = CommandPreHandler:a) && EverythingStep: ca.thing) return b;
+  if ((auto cb = CommandPreHandler:b) && EverythingStep: cb.thing) return a;
+  
+  // TODO: memoize for efficiency?
+  int count_leaves(PreHandler hdl) {
+    if (auto ints = PreIntersect: hdl) {
+      return count_leaves(ints.a) + count_leaves(ints.b);
+    }
+    return 1;
+  }
+  int la = count_leaves(a), lb = count_leaves(b);
+  // wlog a is smaller
+  if (la > lb) { (la, lb) = (lb, la); (a, b) = (b, a); }
+  if (2 * la < lb) { // grossly unbalanced
+    PreHandler (ba, bb) = (PreIntersect:b).(a, b);
+    int lba = count_leaves(ba), lbb = count_leaves(bb);
+    // wlog ba is smaller
+    if (lba > lbb) { (lba, lbb) = (lbb, lba); (ba, bb) = (bb, ba); }
+    // rebalance: return intersect(intersect(smallest, smaller), larger)
+    return mkIntersect(mkIntersect(a, ba), bb);
+  }
+  
+  return new PreIntersect(a, b);
+}
+
+CommandHandler[] buildIntersect(CommandHandler[] obj1, obj2) {
+  // writeln "build intersect from";
+  // writeln " :1: $obj1";
+  // writeln " :2: $obj2";
+  CommandHandler[auto~] res;
+  auto ar = new AllocEmptyResult 2;
+  auto j1 = new Jump, j2 = new Jump;
+  res ~= ar; // 2 res++
+  res ~= new CopyRay;
+  res ~= new AllocInfo;
+  
+  j1.to res.length;
+  j2.to res.length;
+  res ~= new IntersectStep(obj1.length + 1 + 1, obj2.length + 1 + 1); // 1 res-
+  
+  res ~= obj1; // 2 res+
+  j1.from res.length;
+  res ~= j1;
+  res ~= new FreeResult; // NEVER CALLED (between jump and IntersectStep target)
+                         // 1 res-
+  
+  res ~= obj2; // 2 res+
+  j2.from res.length;
+  res ~= j2;
+  res ~= new FreeResult; // 1 res-
+  
+  res ~= new FreeInfo;
+  res ~= new FreeRay;
+  return res[];
+}
+
+class IntersectStep : CommandHandler {
+  int skipsz1, skipsz2;
+  void init(int s1, s2) { skipsz1 = s1; skipsz2 = s2; }
+  override {
+    string toString() { return "IntersectStep($skipsz1, $skipsz2)"; }
+    /**
+      flow:
+      alloc 2 results               + 2 result
+      copy ray                      + 1 ray
+      alloc ray info                + 1 info
+      
+      csgstep frees 1, skips to object block or past
+                                    - 1 result
+      object 1; jump back to csg    + 1 result
+      free 1 result - never called! - 1 result
+      ^ this is only here so that object2 thinks it's called with 1
+      ^ object allocated - which it will be, in practice
+      object 2; jump back to csg    + 1 result
+      free 1 result - never called! - 1 result
+      free 1 ray                    - 1 ray
+      free ray info                 - 1 info
+      
+      continue with one result total allocated
+      
+      csgstep is always entered with 2 results allocated.
+      this is important because it makes the slot1/slot2 mapping unambiguous.
+      
+      we always "eat" one result so that the command we invoke has space to save one
+      so we end up with: allocate 2, peak, consume 1, allocate +1 -1 +1, free 1
+      which works out to two peak one final which is correct!
+      so we always leave with 1 result allocated, even at the end.
+    **/
+    void recordEffect(VMStats* stats) { stats.consumesResult; }
+    bool irregularStep() { return true; } // oh so very true.
+    void process(VMState[] list, int start, end) {
+      for int i <- start..end {
+        ref sp = list[i];
+        if (sp.handler !is CommandHandler:this) fail;
+        sp.stream = sp.stream[1 .. $];
+        
+        alias statemask= 0b01111;
+        alias flipmask = 0b10000;
+        ref slot1 = resplanes[sp.result-id-1][i];
+        ref slot2 = resplanes[sp.result-id-0][i];
+        
+        int gid = sp.gid;
+        alias dbg = false;
+        
+        // reference having been taken, we are free to "free up" slot2 now
+        using sp mixin(freeResult.replace("!!", "1"));
+        
+        ref state = slot1.data;
+        
+        ref my_info = infoplanes[sp.info-id-1][i];
+        
+        ref info = infoplanes[sp.info-id][i];
+        
+        // normally, slot1 is object1 and slot2 is object2.
+        // but when rechecking, slot1 is always the farther object
+        // so if slot1 is object2, set this to true.
+        alias flippedObjects = !!(state & flipmask);
+        if (state & statemask == 0) { // initial
+          if (dbg) printf("%i: state 0 -> 1 (%p)\n", gid, &state);
+          info.want(enter => true, leave => true); // we ourselves must be interested in either, for the moment
+          // make space in slot2 for object1
+          state = 1;
+        } else if (state & statemask == 1) { // got object1 in slot2.
+          if (dbg) printf("%i: state 1 -> 2 (%p)\n", gid, &state);
+          if (!slot2.success) {
+            sp.stream = sp.stream[skipsz1 + skipsz2 .. $]; // no hits possible
+            continue;
+          }
+          // got our first result. transcribe.
+          slot1.copyFrom &slot2;
+          state = 2; // main state
+          // do object2 in slot2.
+          sp.stream = sp.stream[skipsz1 .. $];
+        } else if (state & statemask == 2) { // got object2 in slot2
+          if (dbg) printf("%i: state 2\n", gid);
+          float getFixupChangeSlot1() {
+            // to bring slot1 from "shifted ray" distance back into "original ray" distance,
+            // fixup distance proportional to the distance between
+            ref ray = rayplanes[sp.ray-id-0][i];
+            // and
+            ref prevray = rayplanes[sp.ray-id-1][i];
+            // so
+            return |ray.pos - prevray.pos| / |ray.dir|;
+          }
+          void fixupDistance() {
+            slot1.distance += getFixupChangeSlot1();
+          }
+          // got object2 in slot2
+          if (!slot2.success) {
+            sp.stream = sp.stream[skipsz1 + skipsz2 .. $]; // no hits possible
+            slot1.success = false;
+            if (dbg) printf("%i: no success in slot2, abort\n", gid);
+            continue;
+          }
+          /**
+            Four possibilities.
+            let A be the close object, and B the far object
+            [Exited  A] [Exited  B] = A hit is exit point (implicit: "entered A, entered B")
+            [Entered A] [Exited  B] = A hit is entry point (implicit: "entered B")
+            [Exited  A] [Entered B] = indeterminate, advance ray past A and redo (implicit: "entered A")
+            [Entered A] [Entered B] = indeterminate, advance ray past A and redo
+          **/
+          bool
+            wasInSlot1Object = slot1.hitFromInside,
+            wasInSlot2Object = slot2.hitFromInside,
+            wasInObject1 = [wasInSlot1Object, wasInSlot2Object][flippedObjects],
+            wasInObject2 = [wasInSlot2Object, wasInSlot1Object][flippedObjects],
+            slot2ObjectIsCloser = slot2.distance < slot1.distance,
+            slot1ObjectIsCloser = !slot2ObjectIsCloser,
+             firstObjectIsCloser = [slot1ObjectIsCloser, slot2ObjectIsCloser][flippedObjects],
+            secondObjectIsCloser = [slot2ObjectIsCloser, slot1ObjectIsCloser][flippedObjects],
+            wasInFarObject = (slot1ObjectIsCloser && wasInSlot2Object) || (slot2ObjectIsCloser && wasInSlot1Object);
+          // writeln scope= "  $(wasInSlot1Object) $(wasInSlot2Object) and $(wasInObject1) $(wasInObject2) but $(slot1ObjectIsCloser) at $(slot1.distance) and $(slot2.distance) so $(firstObjectIsCloser) consequently $(wasInFarObject)";
+          // exited - or entered - intersect at the close point
+          if (dbg) printf("%i: debug: %i, %i and %i, %i\n", gid, slot1.success, slot2.success, slot1.hitFromInside, slot2.hitFromInside);
+          if (wasInFarObject) {
+            if (dbg) printf("%i: was in far object... %f, %f and we %i and %i\n", gid, double:slot1.distance, double:slot2.distance, slot1.hitFromInside, slot2.hitFromInside);
+            if (dbg) printf("%i: TEST2: %f at %p\n", gid, double:slot1.distance, &slot1.distance);
+            // closest object is our exit/entry point, so save it and done.
+            if (slot2ObjectIsCloser) {
+              if (dbg) printf("%i: slot2 provides our true hit\n", gid);
+              auto backup = slot1.data;
+              slot1.copyFrom &slot2;
+              slot1.data = backup;
+            }
+            
+            if (!slot1.hitFromInside && my_info.wantOutsideHits() || slot1.hitFromInside && my_info.wantInsideHits()) {
+              // now the ray had previously been moved forward
+              // so fix it up
+              if (dbg) printf("%i: we have gained a hit, yay, go us\n", gid);
+              if (dbg) printf("%i: it is at %f\n", gid, double:slot1.distance);
+              if (dbg && slot2ObjectIsCloser) printf("%i: we got it from slot2 tho\n", gid);
+              fixupDistance;
+              if (dbg) printf("%i: but we fix it up to %f\n", gid, double:slot1.distance);
+              if (dbg) printf("%i: it has a reflect of %f,%f,%f and a normal of %f,%f,%f\n", gid, slot1.reflective-color.(double:x,double:y,double:z), slot1.normal.(double:x,double:y,double:z));
+              
+              sp.stream = sp.stream[skipsz1 + skipsz2 .. $];
+              continue;
+            }
+            
+            if (dbg) printf("%i: skip this impact; it is uninteresting (we %.*s)\n", gid, my_info.toString());
+          }
+          // we were outside our far object, or had an uninteresting event
+          // so we discard our near object and redo it
+          // first, advance ray past close object
+          ref ray = rayplanes[sp.ray-id][i];
+          
+          if (dbg) printf("%i: %f, %f, %i\n", gid, double:slot1.distance, double:slot2.distance, slot1ObjectIsCloser);
+          
+          float dist = [slot1.distance, slot2.distance][slot2ObjectIsCloser];
+          
+          if (dist == float.infinity) {
+            // both are infinitely distant
+            // so our slot1 hit is ... probably fine?
+            // TODO work out in detail what happens here
+            if (dbg) printf("%i: we're infinitely far out anyways, so just report it as a %i hit\n", gid, slot1.hitFromInside);
+            sp.stream = sp.stream[skipsz1 + skipsz2 .. $];
+            continue;
+          }
+          
+          // dist = dist * epsfg + eps; // past!
+          
+          if (dbg) printf("%i: so advance by %f to %f, %f, %f\n", gid, double:dist, ray.(pos+dir*dist).(double:x, double:y, double:z));
+          if (dbg) printf("%i: with a %i even though we said we %.*s\n", gid, slot1.hitFromInside, info.toString());
+          
+          ray.pos += ray.dir * dist;
+          // second, make sure we save the far object
+          if (slot1ObjectIsCloser) {
+            if (dbg) printf("%i: so backup slot2 into slot1\n", gid);
+            // we just flipped our slot-object mapping!
+            auto newstate = state xor flipmask;
+            slot1.copyFrom &slot2;
+            slot1.data = newstate;
+            slot2.success = false;
+          }
+          if (dbg) printf("%i: and fixup %f to %f due to %f\n", gid, double:slot1.distance, double:(slot1.distance - dist), double:dist);
+          slot1.distance -= dist; // reposition
+          if (dbg) printf("%i: TEST1: %f at %p (%i)\n", gid, double:slot1.distance, &slot1.distance, state);
+          if (slot1.distance < 0) {
+            // fail "whuh $dist $(slot1.distance) $(slot2.distance)";
+            // okay what happened here is
+            // the objects are so close that skipping past the near placed us _inside_ the far
+            // fixup the distance again and count it as a hit
+            fixupDistance;
+            // writeln "whuh weird success";
+            sp.stream = sp.stream[skipsz1 + skipsz2 .. $];
+            if (dbg) printf("%i: no success in slot2, abort\n", gid);
+            continue;
+          }
+          // third, redo (close) object in slot2.
+          // note: state stays 2!
+          if (!flippedObjects) {
+            // normally, slot2 is object2.
+            sp.stream = sp.stream[skipsz1 .. $];
+            // if we were inside object2, we only want the far hit now
+            info.want(enter => wasInObject2, leave => !wasInObject2);
+            if (dbg) printf("%i: well in the future because %i we only %.*s when redoing object2 (%p)\n", gid, wasInObject2, info.toString(), &state);
+          } else {
+            // else slot2 is object1 and we can just keep going.into it
+            info.want(enter => wasInObject1, leave => !wasInObject1);
+            if (dbg) printf("%i: well in the future because %i we only %.*s when redoing object1 (%p)\n", gid, wasInObject1, info.toString(), &state);
+          }
+          if (dbg) printf("%i: redo with (%f, %f, %f) -> (%f, %f, %f)\n", gid, ray.pos.(double:x,double:y,double:z), ray.dir.(double:x,double:y,double:z));
+        } else assert(false, "unknown state: $state !!");
+      }
+    }
+  }
+}

@@ -7,27 +7,36 @@ int rayplane_size;
 // JUST an optimization to avoid a multiply! MUST be sequential in all_rayplanes!
 Ray[][] rayplanes;
 
+TraceInfo[] all_infoplanes;
+int infoplane_size;
+TraceInfo[][] infoplanes;
+
 Result[] all_resplanes;
 int resplane_size;
 // Likewise!
 Result[][] resplanes;
 
 void initPlaneMaps() {
+  if (rayplanes)  rayplanes.free;
+  if (resplanes)  resplanes.free;
+  if (infoplanes) infoplanes.free;
   alias rayiter = [for i <- 0..all_rayplanes.length / rayplane_size:
     all_rayplanes[rayplane_size * i .. rayplane_size * (i + 1)]];
   alias resiter = [for i <- 0..all_resplanes.length / resplane_size:
     all_resplanes[resplane_size * i .. resplane_size * (i + 1)]];
-  rayplanes = rayiter.eval[];
-  resplanes = resiter.eval[];
+  alias infiter = [for i <- 0..all_infoplanes.length / infoplane_size:
+    all_infoplanes[infoplane_size * i .. infoplane_size * (i + 1)]];
+  rayplanes  = rayiter.eval[];
+  resplanes  = resiter.eval[];
+  infoplanes = infiter.eval[];
 }
-
-shared CommandHandler[] fullStream; // used for OpenCL
 
 struct VMState {
   CommandHandler[] stream;
   
-  int result-id, ray-id;
+  int result-id, ray-id, info-id;
   
+  int gid;
   // int state;
   // float state2;
   // int burnInCounter;
@@ -36,24 +45,24 @@ struct VMState {
   // bool cached, cachedBack;
   
   alias handler = stream[0];
-  alias allocResult = `{ result-id ++; resplanes[result-id-1][i].success = false; }`;
-  alias freeResult = `
-    result-id -= !!;
-  `;
+  alias allocResult = `{ result-id ++; resplanes[result-id][i].success = false; }`;
+  alias freeResult = `result-id -= !!;`;
   alias allocRay = `ray-id ++;`;
-  alias freeRay = `
-    ray-id -= !!;
-  `;
+  alias freeRay = `ray-id -= !!;`;
+  alias allocInfo = `info-id ++;`;
+  alias freeInfo = `info-id -= !!;`;
 }
+
+shared CommandHandler[] fullStream; // used for OpenCL
 
 extern(C) float acosf(float);
 import std.math;
 vec3f evaluateRay(VMState* sp, int i, int firstRay, firstRes, end = 0, bool* isBack = null) {
   // auto rays = sp.rays[firstRay .. $ - end], hits = sp.results[firstRes .. $ - end];
-  int numRays = (sp.ray-id - end) - firstRay, numHits = (sp.result-id - end) - firstRes;
+  int numRays = (sp.ray-id - end + 1) - firstRay, numHits = (sp.result-id - end + 1) - firstRes;
   if (numRays != numHits) {
     writeln "Mismatched call for evaluateRay: $numRays and $numHits";
-    asm `int $3`;
+    _interrupt 3;
   }
   
   if (numHits != 1) {

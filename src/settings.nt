@@ -1,0 +1,49 @@
+module settings;
+
+shared int markovSteps, burnInLimit;
+shared float minBrightnessFactor;
+shared (int, int) dbgPos;
+shared bool break-on-float-errors;
+
+void init() using settings {
+  desired-fps = 0.5;
+  threads = 4;
+  samples = 1;
+  file = "out.png";
+  dbgPos = (-1, -1);
+  markovSteps = 512;
+  // burnInLimit = 128;
+  burnInLimit = 0;
+  minBrightnessFactor = 0;
+  useBoehm = false;
+  enableRCache = false;
+  // allowLensmut = true;
+  depth = 10;
+  savestep = 4;
+  // empirically determined to be fastest thereabouts. not sure why.
+  // here's a quick&dirty benchmark
+  /*
+    for t in {0..16}
+    do
+      GRP=$((1 << t))
+      TT=$(/usr/bin/time -p ./pt -r "1024x1024" -g $GRP 2>&1 |grep ^user |cut -d\  -f2)
+      echo "$GRP $TT"
+    done
+  */
+  groupsize = 256;
+}
+
+shared context settings {
+  float desired-fps;
+  int threads; // number of subdivisions
+  int samples;
+  (int, int) imgres; // fixed-size single-pass render
+  string file;
+  bool average, useBoehm, saveFrames, enableRCache;
+  int depth;
+  string input;
+  float savestep;
+  int groupsize;
+  int count;
+  int rays-needed, results-needed, info-needed, stack-needed;
+}

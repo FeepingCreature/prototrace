@@ -379,8 +379,8 @@ void main(string[] args) {
         state.stream = xstream;
         // state.state = 0;
         using state {
-          result-id = 0;
-          ray-id = 1;
+          result-id = -1;
+          ray-id = 0;
           // auto dir = vec3f(fx, fy, 1);
           // dir /= vec3f(|dir|);
           // ray.pos = vec3f(0, 2, 0);

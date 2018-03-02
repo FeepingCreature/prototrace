@@ -1,11 +1,11 @@
 module scene.translate;
 
-import scene.base;
+import scene.base, scene.util;
 
-class Translate : SceneObject {
+class Translate : SceneObject, CommandHandler {
   vec3f vector;
-  SceneObject sup;
-  class PostTranslate : CommandHandler {
+  void init(vec3f v) vector = v;
+  override {
     void process(VMState[] list, int start, end) {
       for int i <- start .. end {
         auto sp = &list[i];
@@ -13,33 +13,31 @@ class Translate : SceneObject {
         if (void*:sp.handler == void*:CommandHandler:this)::
         sp.stream = sp.stream[1..$];
         
-        using sp mixin(freeRay.replace("!!", "1"));
+        ref ray = rayplanes[sp.ray-id][i];
+        using sp mixin(allocRay);
+        rayplanes[sp.ray-id][i].(pos, dir) = ray.(pos - vector, dir);
       }
     }
-  }
-  void init(vec3f v, SceneObject so) (vector, sup) = (v, so);
-  bool collide(Ray* ray, Result* res) {
-    Ray ray2 = void;
-    ray2.pos = ray.pos - vector;
-    ray2.dir = ray.dir;
-    return sup.collide(&ray2, res);
-  }
-  void process(VMState[] list, int start, end) {
-    for int i <- start .. end {
-      auto sp = &list[i];
-      
-      if (void*:sp.handler == void*:CommandHandler:this)::
-      sp.stream = sp.stream[1..$];
-      
-      auto ray = &rayplanes[sp.ray-id-1][i];
-      using sp mixin(allocRay);
-      rayplanes[sp.ray-id-1][i].(pos, dir) = ray.(pos - vector, dir);
-    }
-  }
-  CommandHandler[] buildCommandStream(VMStats* stats) {
-    stats.needsRay;
-    auto res = CommandHandler[]:null ~ this ~ sup.buildCommandStream(stats) ~ new PostTranslate;
-    stats.rays-needed-cur --;
-    return res;
+    bool irregularStep() { return false; }
+    void recordEffect(VMStats* stats) { stats.addsRay(); }
   }
 }
+
+CommandHandler[] buildTranslate(vec3f vector, CommandHandler[] obj) {
+  CommandHandler[auto~] res;
+  auto tl = new Translate(vector);
+  res ~= tl;
+  res ~= obj;
+  res ~= new FreeRay;
+  return res[];
+}
+
+class PreTranslate : PreHandler {
+  vec3f vector;
+  PreHandler sub;
+  void init(vec3f vector, PreHandler sub) this.(vector, sub) = (vector, sub);
+  override void iterate(void delegate(PreHandler) dg) { dg sub; }
+  override CommandHandler[] flatten() { return buildTranslate(vector, scope= sub.flatten()); }
+}
+
+PreHandler mkTranslate(vec3f vector, PreHandler sub) { return new PreTranslate(vector, sub); }

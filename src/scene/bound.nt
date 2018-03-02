@@ -1,8 +1,68 @@
 module scene.bound;
 
-import scene.base;
+import scene.base, scene.util;
 
-extern(C) bool fast_rayHitsAABB(vec3f* abp, p_ray, float* dist);
+bool rayHitsAABB(vec3f* ab, vec3f* p_ray, (float, float)* dist) {
+  import c.math;
+  alias p_a = &ab[0];
+  alias p_b = &ab[1];
+  alias p_pos = &p_ray[0];
+  alias p_dir = &p_ray[1];
+  alias mask = vec3i(int:0x80000000);
+  // gather sign bits of direction vector
+  
+  // normalize via symmetry: flip so that dir becomes positive
+  // (0^0=0, 1^1=0 on the sign bit)
+  vec3f a, b, pos, dir;
+  {
+    auto signs = *vec3i*:p_dir & mask;
+    a = *vec3f*:&auto= *vec3i*:p_a xor signs;
+    b = *vec3f*:&auto= *vec3i*:p_b xor signs;
+    pos = *vec3f*:&auto= *vec3i*:p_pos xor signs;
+    dir = *vec3f*:&auto= *vec3i*:p_dir xor signs;
+  }
+  
+  {
+    auto b_backup = b;
+    // pretend ray starts at origin: - pos
+    b = max(a, b) - pos;
+    
+    {
+      auto bsign = *vec3i*:&b & mask;
+      // since ray starts at origin and goes towards +,+,+:
+      // if our aabb ends in the negative on any axis,
+      // then ray is pointed away from aabb
+      if (bsign.x || bsign.y || bsign.z) return false;
+    }
+    
+    a = min(a, b_backup) - pos;
+  }
+  
+  alias v4dir = *vec4f*:&dir;
+  v4dir.w = 1;
+  auto idir = 1 / dir;
+  
+  if (dir.x != 0 && dir.y != 0 && dir.z != 0) {
+    a *= idir;
+    b *= idir;
+  } else {
+    if (dir.x != 0) { a.x *= idir.x; b.x *= idir.x; }
+    else { a.x = copysignf(float.infinity, a.x); b.x = copysignf(float.infinity, b.x); }
+    if (dir.y != 0) { a.y *= idir.y; b.y *= idir.y; }
+    else { a.y = copysignf(float.infinity, a.y); b.y = copysignf(float.infinity, b.y); }
+    if (dir.z != 0) { a.z *= idir.z; b.z *= idir.z; }
+    else { a.z = copysignf(float.infinity, a.z); b.z = copysignf(float.infinity, b.z); }
+  }
+  // entry: distance where ray is past the entry wall of the aabb on all axes
+  float entry = max(a.x, max(a.y, a.z));
+  // exit: distance where ray is past the exit wall of the aabb on any axis
+  float exit = min(b.x, min(b.y, b.z));
+  if (dist) {
+    dist._0 = entry;
+    dist._1 = 1;
+  }
+  return entry <= exit;
+}
 
 struct AABB {
   vec3f a, b;
@@ -16,11 +76,7 @@ struct AABB {
     }
   }
   bool rayHits(vec3f* ray-p, (float, float)* dist = null) {
-    // return rayHitsAABB(&a, &b, pos-p, dir-p, dist);
-    float f;
-    auto res = fast_rayHitsAABB(&a, ray-p, &f);
-    if (dist) { *dist = (f, 1); }
-    return res;
+    return rayHitsAABB(&a, ray-p, dist);
   }
 }
 
@@ -34,7 +90,8 @@ class BoxBound : CommandHandler {
   }*/
   void init(int skip) { this.skip = skip; }
   void init(vec3f a, vec3f b, int skip) { addBox(a, b); this.skip = skip; }
-  override string toString() return "BoxBound\t$(aabb.a) -- $(aabb.b)";
+  override string toString() return "BoxBound { $(aabb.a), $(aabb.b), $skip }";
+  override bool irregularStep() { return true; }
   void addBox(vec3f a, b) {
     if (!aabbIsInited) {
       aabbIsInited = true;
@@ -52,13 +109,32 @@ class BoxBound : CommandHandler {
     for int i <- from .. to {
       ref sp = list[i];
       
-      if (sp.handler !is CommandHandler:this) continue;
+      if (sp.handler !is CommandHandler:this) fail;
       sp.stream = sp.stream[1..$];
       
-      if (!aabb.rayHits(&rayplanes[sp.ray-id-1][i].pos)) {
+      if (!aabb.rayHits(&rayplanes[sp.ray-id][i].pos)) {
         sp.stream = sp.stream[skip..$];
         using sp mixin(allocResult);
       }
     }
+    // does nothing :(
+    // if (to - from <= 128) sortPlanes(list, from, to);
   }
 }
+
+class PreBound : PreHandler {
+  vec3f a, b;
+  PreHandler sub;
+  void init(vec3f a, b, PreHandler sub) this.(a, b, sub) = (a, b, sub);
+  override void iterate(void delegate(PreHandler) dg) { dg sub; }
+  override string toString() { return "PreBound $a - $b"; }
+  override CommandHandler[] flatten() {
+    scope subcmd = sub.flatten();
+    CommandHandler[auto~] res;
+    res ~= new BoxBound(a, b, subcmd.length);
+    res ~= subcmd;
+    return res[];
+  }
+}
+
+PreHandler mkBoxBound(vec3f a, b, PreHandler sub) { return new PreBound(a, b, sub); }

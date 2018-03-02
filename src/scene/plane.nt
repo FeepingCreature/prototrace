@@ -2,170 +2,179 @@ module scene.plane;
 
 import scene.base, std.string;
 
-import c.CL.cl;
+alias EnableCL = false;
+static if (EnableCL) {
+  import c.CL.cl;
 
-defmode CL "prefix CL_ prefix cl prefix cl_";
-pragma(lib, "OpenCL");
+  defmode CL "prefix CL_ prefix cl prefix cl_";
+  pragma(lib, "OpenCL");
 
-import std.thread;
-shared Mutex clLock;
-void init() { clLock = new Mutex; }
+  import std.thread;
+  shared Mutex clLock;
+  void init() { clLock = new Mutex; }
 
-void clcheck(int thing) {
-  if (thing != CL_SUCCESS) {
-    raise new Error "check failed: $thing";
+  void clcheck(int thing) {
+    if (thing != CL_SUCCESS) {
+      raise new Error "check failed: $thing";
+    }
   }
-}
-
-extern(C) void logToConsole(char* errinfo, void* private_info, int cb, void* user_data) {
-  auto _threadlocal = user_data;
-  writeln "ERROR: $(CToString errinfo)";
-}
-
-auto clBuild(string name, source) using mode CL {
-  void header(string s) { writeln "\n ==== $s ==== "; }
   
-  template checked(alias A) {
-    template checked(T) {
-      template checked(U) {
-        T[] checked(U u) {
-          check A(u, 0, null, &int len);
-          auto res = new T[] len;
-          check A(u, len, res.ptr, null);
-          static if (types-equal(T, char)) {{
-            if (res.length && res[$-1] == 0)
-              res = res[0..$-1]; // remove trailing zero
-          }}
-          return res;
+  extern(C) void logToConsole(char* errinfo, void* private_info, int cb, void* user_data) {
+    auto _threadlocal = user_data;
+    writeln "ERROR: $(CToString errinfo)";
+  }
+  
+  auto clBuild(string name, source) using mode CL {
+    void header(string s) { writeln "\n ==== $s ==== "; }
+    
+    template checked(alias A) {
+      template checked(T) {
+        template checked(U) {
+          T[] checked(U u) {
+            check A(u, 0, null, &int len);
+            auto res = new T[] len;
+            check A(u, len, res.ptr, null);
+            static if (types-equal(T, char)) {{
+              if (res.length && res[$-1] == 0)
+                res = res[0..$-1]; // remove trailing zero
+            }}
+            return res;
+          }
         }
       }
     }
-  }
-  
-  platform_id[] platforms;
-  using LockedMutex:clLock {
-    platforms = checked!GetPlatformIDs!platform_id();
-    if (!platforms.length) {
-      fail "No OpenCL platforms found";
+    
+    platform_id[] platforms;
+    using LockedMutex:clLock {
+      platforms = checked!GetPlatformIDs!platform_id();
+      if (!platforms.length) {
+        fail "No OpenCL platforms found";
+      }
     }
-  }
-  
-  header "platforms";
-  for auto plat <- platforms {
-    auto name    = checked!GetPlatformInfo!char(plat, PLATFORM_NAME);
-    auto profile = checked!GetPlatformInfo!char(plat, PLATFORM_PROFILE);
-    auto version = checked!GetPlatformInfo!char(plat, PLATFORM_VERSION);
-    auto vendor  = checked!GetPlatformInfo!char(plat, PLATFORM_VENDOR);
-    writeln "$plat: $name $version ($vendor, $profile)";
-  }
-  device_id chosen;
-  header "devices";
-  for auto plat <- platforms {
-    auto devs = checked!GetDeviceIDs!device_id(plat, DEVICE_TYPE_ALL);
-    for auto dev <- devs {
-      if (!chosen) chosen = dev;
-      auto name     = checked!GetDeviceInfo!char(dev, DEVICE_NAME);
-      auto profile  = checked!GetDeviceInfo!char(dev, DEVICE_PROFILE);
-      auto vendor   = checked!GetDeviceInfo!char(dev, DEVICE_VENDOR);
-      auto cl-version = checked!GetDeviceInfo!char(dev, DEVICE_VERSION);
-      auto driver-version = checked!GetDeviceInfo!char(dev, DRIVER_VERSION);
-      writeln "$plat:$dev: $name $driver-version ($vendor, $profile, $cl-version)";
+    
+    header "platforms";
+    for auto plat <- platforms {
+      auto name    = checked!GetPlatformInfo!char(plat, PLATFORM_NAME);
+      auto profile = checked!GetPlatformInfo!char(plat, PLATFORM_PROFILE);
+      auto version = checked!GetPlatformInfo!char(plat, PLATFORM_VERSION);
+      auto vendor  = checked!GetPlatformInfo!char(plat, PLATFORM_VENDOR);
+      writeln "$plat: $name $version ($vendor, $profile)";
     }
-  }
-  if (!chosen) {
-    fail "No OpenCL device found";
-  }
-  auto context = CreateContext(null, 1, &chosen, &logToConsole, _threadlocal, &int errcode_ret);
-  check errcode_ret;
-  auto queue = context.CreateCommandQueue(chosen, 0, &errcode_ret);
-  check errcode_ret;
-  auto program = context.CreateProgramWithSource(1, &source.ptr, &int len = source.length, &errcode_ret);
-  {
-    onFailure {
-      auto buildstatus = checked!GetProgramBuildInfo!char(program, chosen, PROGRAM_BUILD_LOG);
-      writeln "fail: $buildstatus";
+    device_id chosen;
+    header "devices";
+    for auto plat <- platforms {
+      auto devs = checked!GetDeviceIDs!device_id(plat, DEVICE_TYPE_ALL);
+      for auto dev <- devs {
+        if (!chosen) chosen = dev;
+        auto name     = checked!GetDeviceInfo!char(dev, DEVICE_NAME);
+        auto profile  = checked!GetDeviceInfo!char(dev, DEVICE_PROFILE);
+        auto vendor   = checked!GetDeviceInfo!char(dev, DEVICE_VENDOR);
+        auto cl-version = checked!GetDeviceInfo!char(dev, DEVICE_VERSION);
+        auto driver-version = checked!GetDeviceInfo!char(dev, DRIVER_VERSION);
+        writeln "$plat:$dev: $name $driver-version ($vendor, $profile, $cl-version)";
+      }
     }
+    if (!chosen) {
+      fail "No OpenCL device found";
+    }
+    auto context = CreateContext(null, 1, &chosen, &logToConsole, _threadlocal, &int errcode_ret);
     check errcode_ret;
-    check program.BuildProgram(0, null, "-Werror", null, null);
-    auto kernel = program.CreateKernel(toStringz name, &errcode_ret);
+    auto queue = context.CreateCommandQueue(chosen, 0, &errcode_ret);
     check errcode_ret;
-    return (context, kernel, queue);
+    auto program = context.CreateProgramWithSource(1, &source.ptr, &int len = source.length, &errcode_ret);
+    {
+      onFailure {
+        auto buildstatus = checked!GetProgramBuildInfo!char(program, chosen, PROGRAM_BUILD_LOG);
+        writeln "fail: $buildstatus";
+      }
+      check errcode_ret;
+      check program.BuildProgram(0, null, "-Werror", null, null);
+      auto kernel = program.CreateKernel(toStringz name, &errcode_ret);
+      check errcode_ret;
+      return (context, kernel, queue);
+    }
   }
+
+  alias planeprocess = `
+    typedef struct struct_VMState {
+      size_t stream_len;
+      size_t stream_ptr;
+      int resultid, rayid;
+    } VMState;
+    typedef struct struct_Result {
+      float distance; float filler1[3];
+      float3 normal;
+      float4 reflective, emissive;
+      float2 texcoord;
+      void *texinfo;
+      int data, success;
+      int filler2[3]; // bring to 24 ints
+    } Result;
+    typedef struct struct_Ray {
+      float3 pos, dir;
+    } Ray;
+    kernel void planeprocess(global VMState *state_ptr,
+      global int    *fullStream,   int host_stream_base,
+      global Ray    *rayplane_all, int rayplane_size,
+      global Result *resplane_all, int resplane_size,
+      float3 normal, float3 base,  int state_compare, int start)
+    {
+      int i = get_local_id(0) + start;
+      
+      global VMState *sp = &state_ptr[i];
+      if (fullStream[((int) sp->stream_ptr - host_stream_base) / 4] != state_compare) return;
+      sp->stream_ptr += 4;
+      sp->stream_len -= 1;
+      
+      global Ray *ray = &rayplane_all[rayplane_size * (sp->rayid - 1) + i];
+      float3 pos = ray->pos, dir = ray->dir;
+      
+      sp->resultid ++;
+      
+      global Result *res = &resplane_all[resplane_size * (sp->resultid - 1) + i];
+      res->success = false;
+      float denom = dot(dir, normal);
+      
+      float predist = -dot(normal, pos - base);
+      if (denom * predist > 0) { // if a*b > 0, then a/b also > 0
+        res->success = true;
+        res->reflective = (float4) (1, 1, 1, 1);
+        res->emissive = (float4) (0, 0, 0, 0);
+        res->distance = predist / denom;
+        res->normal = normal;
+      }
+    }
+  `;
+
+  static if (size-of VMState != 16 || size-of Result != 24*4 || size-of Ray != 8*4) {
+    pragma(msg, string-of (size-of VMState / 4));
+    pragma(msg, string-of (size-of Result / 4));
+    pragma(msg, string-of (size-of Ray / 4));
+    pragma(fail, ":(");
+  }
+  import std.hashmap;
+  Hashmap!(void*, (cl_context context, cl_kernel kernel, cl_command_queue queue)) plane-cl-map;
 }
 
-alias planeprocess = `
-  typedef struct struct_VMState {
-    size_t stream_len;
-    size_t stream_ptr;
-    int resultid, rayid;
-  } VMState;
-  typedef struct struct_Result {
-    float distance; float filler1[3];
-    float3 normal;
-    float4 reflective, emissive;
-    float2 texcoord;
-    void *texinfo;
-    int data, success;
-    int filler2[3]; // bring to 24 ints
-  } Result;
-  typedef struct struct_Ray {
-    float3 pos, dir;
-  } Ray;
-  kernel void planeprocess(global VMState *state_ptr,
-    global int    *fullStream,   int host_stream_base,
-    global Ray    *rayplane_all, int rayplane_size,
-    global Result *resplane_all, int resplane_size,
-    float3 normal, float3 base,  int state_compare, int start)
-  {
-    int i = get_local_id(0) + start;
-    
-    global VMState *sp = &state_ptr[i];
-    if (fullStream[((int) sp->stream_ptr - host_stream_base) / 4] != state_compare) return;
-    sp->stream_ptr += 4;
-    sp->stream_len -= 1;
-    
-    global Ray *ray = &rayplane_all[rayplane_size * (sp->rayid - 1) + i];
-    float3 pos = ray->pos, dir = ray->dir;
-    
-    sp->resultid ++;
-    
-    global Result *res = &resplane_all[resplane_size * (sp->resultid - 1) + i];
-    res->success = false;
-    float denom = dot(dir, normal);
-    
-    float predist = -dot(normal, pos - base);
-    if (denom * predist > 0) { // if a*b > 0, then a/b also > 0
-      res->success = true;
-      res->reflective = (float4) (1, 1, 1, 1);
-      res->emissive = (float4) (0, 0, 0, 0);
-      res->distance = predist / denom;
-      res->normal = normal;
-    }
-  }
-`;
-
-static if (size-of VMState != 16 || size-of Result != 24*4 || size-of Ray != 8*4) {
-  pragma(msg, string-of (size-of VMState / 4));
-  pragma(msg, string-of (size-of Result / 4));
-  pragma(msg, string-of (size-of Ray / 4));
-  pragma(fail, ":(");
+PreHandler mkPlane(vec3f normal, base) {
+  return new CommandPreHandler(new Plane(normal, base));
 }
 
-import std.hashmap;
-Hashmap!(void*, (cl_context context, cl_kernel kernel, cl_command_queue queue)) plane-cl-map;
 class Plane : SceneObject, CommandHandler {
   vec3f normal, base;
   void init(vec3f n, b) {
     normal = n;
     base = b;
   }
+  /*
   auto getCL() {
     if (auto cl = plane-cl-map.get(void*:this)) return *cl;
     auto cl = clBuild("planeprocess", planeprocess);
     plane-cl-map.insert(void*:this, cl);
     return cl;
-  }
-  override string toString() return "Plane\t<$normal, $base>";
+  }*/
+  override string toString() return "Plane { $normal, $base }";
+  override bool irregularStep() { return false; }
   bool collide(Ray* ray, Result* res) {
     float dist = -(normal * (ray.pos - base)).sum / (ray.dir * normal).sum;
     if (dist < 0) return false;
@@ -178,74 +187,93 @@ class Plane : SceneObject, CommandHandler {
     auto normal = normal, base = base; // local copies
     auto cmp = CommandHandler:this;
     bool useOpenCL = false; // REALLY bad on nVidia.
-    if useOpenCL using mode CL {
-      auto cl = getCL();
-      mem x 4 buffers;
-      int errcode;
-      void write(int id, void[] data, int flags) {
-        buffers[id] = CreateBuffer(cl.context, flags,
-          data.length, null, &int errcode);
-        check errcode;
-        check EnqueueWriteBuffer(cl.queue, buffers[id],
-          false, 0, data.length, data.ptr,
+    static if (EnableCL) {
+      if useOpenCL using mode CL {
+        auto cl = getCL();
+        mem x 4 buffers;
+        int errcode;
+        void write(int id, void[] data, int flags) {
+          buffers[id] = CreateBuffer(cl.context, flags,
+            data.length, null, &int errcode);
+          check errcode;
+          check EnqueueWriteBuffer(cl.queue, buffers[id],
+            false, 0, data.length, data.ptr,
+            0, null, null);
+        }
+        write(0, void[]: list, MEM_READ_WRITE);
+        write(1, void[]: fullStream, MEM_READ_ONLY);
+        write(2, void[]: all_rayplanes, MEM_READ_ONLY);
+        write(3, void[]: all_resplanes, MEM_READ_WRITE);
+        onSuccess {
+          for auto buf <- buffers
+            ReleaseMemObject buf;
+        }
+        /**kernel void planeprocess(global VMState *state_ptr,
+          global int    *fullStream,   size_t host_stream_base,
+          global Ray    *rayplane_all, int rayplane_size,
+          global Result *resplane_all, int resplane_size,
+          float3 normal, float3 base,  int state_compare, int start)**/
+        using cl.kernel {
+          SetKernelArg(0, size-of mem, &buffers[0]);
+          SetKernelArg(1, size-of mem, &buffers[1]);
+          SetKernelArg(2, size-of int, &int temp0 = int:fullStream.ptr);
+          SetKernelArg(3, size-of mem, &buffers[2]);
+          SetKernelArg(4, size-of int, &int temp1 = rayplane_size);
+          SetKernelArg(5, size-of mem, &buffers[3]);
+          SetKernelArg(6, size-of int, &int temp2 = resplane_size);
+          SetKernelArg(7, size-of vec3f, &normal);
+          SetKernelArg(8, size-of vec3f, &base);
+          SetKernelArg(9, size-of int, &int temp3 = int:CommandHandler:this);
+          SetKernelArg(10,size-of int, &start);
+        }
+        check EnqueueNDRangeKernel(cl.queue, cl.kernel, 1, null, &int len = end - start, null,
           0, null, null);
+        void read(int id, void[] to) {
+          check EnqueueReadBuffer(cl.queue, buffers[id], false, 0,
+            to.length, to.ptr, 0, null, null);
+        }
+        read(0, void[]: list);
+        read(1, void[]: fullStream);
+        read(2, void[]: all_rayplanes);
+        read(3, void[]: all_resplanes);
+        check Finish cl.queue;
+        return;
       }
-      write(0, void[]: list, MEM_READ_WRITE);
-      write(1, void[]: fullStream, MEM_READ_ONLY);
-      write(2, void[]: all_rayplanes, MEM_READ_ONLY);
-      write(3, void[]: all_resplanes, MEM_READ_WRITE);
-      onSuccess {
-        for auto buf <- buffers
-          ReleaseMemObject buf;
-      }
-      /**kernel void planeprocess(global VMState *state_ptr,
-        global int    *fullStream,   size_t host_stream_base,
-        global Ray    *rayplane_all, int rayplane_size,
-        global Result *resplane_all, int resplane_size,
-        float3 normal, float3 base,  int state_compare, int start)**/
-      using cl.kernel {
-        SetKernelArg(0, size-of mem, &buffers[0]);
-        SetKernelArg(1, size-of mem, &buffers[1]);
-        SetKernelArg(2, size-of int, &int temp0 = int:fullStream.ptr);
-        SetKernelArg(3, size-of mem, &buffers[2]);
-        SetKernelArg(4, size-of int, &int temp1 = rayplane_size);
-        SetKernelArg(5, size-of mem, &buffers[3]);
-        SetKernelArg(6, size-of int, &int temp2 = resplane_size);
-        SetKernelArg(7, size-of vec3f, &normal);
-        SetKernelArg(8, size-of vec3f, &base);
-        SetKernelArg(9, size-of int, &int temp3 = int:CommandHandler:this);
-        SetKernelArg(10,size-of int, &start);
-      }
-      check EnqueueNDRangeKernel(cl.queue, cl.kernel, 1, null, &int len = end - start, null,
-        0, null, null);
-      void read(int id, void[] to) {
-        check EnqueueReadBuffer(cl.queue, buffers[id], false, 0,
-          to.length, to.ptr, 0, null, null);
-      }
-      read(0, void[]: list);
-      read(1, void[]: fullStream);
-      read(2, void[]: all_rayplanes);
-      read(3, void[]: all_resplanes);
-      check Finish cl.queue;
-    } else for int i <- start..end {
+    }
+    for int i <- start..end {
       ref sp = list[i];
       
       if (sp.handler !is cmp) continue;
       sp.stream = sp.stream[1..$];
       
-      ref ray = rayplanes[sp.ray-id-1][i];
+      ref ray = rayplanes[sp.ray-id][i];
       alias pos = ray.pos, dir = ray.dir;
+      
       using sp mixin(allocResult);
-      ref res = resplanes[sp.result-id-1][i];
+      ref res = resplanes[sp.result-id][i];
       
-      auto denom = (dir * normal).sum;
+      ref info = infoplanes[sp.info-id][i];
       
-      res.success = false;
-      float predist = -(normal * (pos - base)).sum;
-      if (denom * predist > 0) { // if a*b > 0, then a/b also > 0
-        res.claim;
-        res.distance = predist / denom;
+      auto denom = -(dir * normal).sum;
+      
+      float predist = (normal * (pos - base)).sum;
+      // if a*b > 0, then a/b also > 0
+      // meaning we're a positive distance away from the plane
+      if (denom * predist > 0) {
+        if (!info.wantInsideHits() && denom < 0) continue;
+        if (!info.wantOutsideHits() && denom > 0) {
+          // as below, we "step past the outside hit" to generate an inside hit at infinity
+          res.hitUniverse;
+          continue;
+        }
+        
+        res.claim(
+          distance => predist / denom,
+          fromInside => denom < 0
+        );
         res.normal = normal;
+      } else if (denom > 0) { // ray on inside of halfspace "exits at infinity"
+        res.hitUniverse;
       }
     }
   }

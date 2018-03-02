@@ -22,8 +22,8 @@ class EnvMap : SceneObject {
       sp.stream = sp.stream[1..$];
       
       using sp mixin(allocResult);
-      auto res = &resplanes[sp.result-id-1][i];
-      auto ray = &rayplanes[sp.ray-id-1][i];
+      ref res = resplanes[sp.result-id][i];
+      ref ray = rayplanes[sp.ray-id][i];
       auto dir = ray.dir;
       
       float angle1 = atan2(dir.x, dir.z);

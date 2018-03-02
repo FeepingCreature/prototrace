@@ -1,0 +1,200 @@
+module client;
+
+platform(i686-mingw32) {
+  pragma(lib, "png");
+  pragma(lib, "jpeg");
+}
+
+import lines, settings, unforth, unforth_pt, base, morton, render, scene.util;
+import std.(string, getopt, thread, socket, zlib, process, math);
+
+void setupMortonBuffer(int task_id, vec4f[] sub_buffer, void delegate() dg) {
+  int (dw, dh) = settings.imgres;
+  
+  auto amorton_window = antimorton_window(settings.imgres);
+  
+  int grpsz = settings.groupsize;
+  int from = task_id * grpsz, to = min(dw * dh, (task_id+1) * grpsz);
+  assert(sub_buffer.length == to - from);
+  
+  using scoped recordResultDg {
+    recordResultDg = λ(Ray* rayp, vec3f col, bool isBack, float factor, bool isMetroHit) {
+      (int x, int y) = ray_to_coords(dw, dh, rayp);
+      
+      if (x < 0 || x >= dw) return;
+      if (y < 0 || y >= dh) return;
+      
+      int i = amorton_window[reverse_morton(x, y)] - from;
+      
+      sub_buffer[i] += col.xyz1 * factor;
+    };
+    dg();
+  }
+}
+
+void main(string[] args) {
+  platform(*-mingw*) { args = executable.split " "; }
+  
+  break-on-float-errors = false;
+  
+  string name, host = "127.0.0.1";
+  short port = 2824;
+  
+  string inputline;
+  
+  using new Options using settings {
+    addLong("help",        "h", λ{ printHelp; exit 0; });
+    addLong("name",        "n", λ(string s) name = s; );
+    addLong("port",        "p", λ(string s) port = short: atoi s; );
+    addLong("dumpmodgraph","q", λ { dumpModuleGraph(); exit 0; });
+    addLong("host",        "s", λ(string s) host = s; );
+    addLong("threads",     "t",λ(string s)threads = atoi s; );
+    args = process args;
+  }
+  
+  auto giveworkqueue = new Channel!void delegate(int);
+  auto resultqueue = new Channel!(int, vec4f[]);
+  auto spaceInSendQueue = new Semaphore;
+  
+  auto tp = new ThreadPool (settings.threads + 1);
+  
+  void sendResults() {
+    set-handler (Error err) {
+      writeln "$(read-pretty-fcc-backtrace())\n$err";
+      invoke-exit "exit";
+    }
+    define-exit "exit" exit(0);
+    for 0 .. (settings.threads * 3) spaceInSendQueue.release; // leave some air
+    
+    auto datasock = new Socket(host, port, allow-ipv6 => false);
+    void sendln(string s) {
+      writeln scope= "[d] > $s";
+      datasock.sendAll ubyte[]: s;
+      datasock.sendAll ubyte[]: "\n";
+    }
+    using new LineReader {
+      lines = splitAt(castIter!string readsocket datasock, "\n");
+      verbose = "d";
+      if (name) sendln scope= "hi im $name";
+      else sendln "hi";
+      expect "hello there";
+      while (true) {
+        auto result = resultqueue.get();
+        scope data = deflate(ubyte[]: result[1]);
+        sendln scope= "sending jobset $(result[0]) $(data.length)";
+        datasock.sendAll data;
+        result[1].free;
+        expect "thanks";
+        spaceInSendQueue.release;
+      }
+    }
+  }
+  
+  void worker() {
+    set-handler (Error err) {
+      writeln "$(read-pretty-fcc-backtrace())\n$err";
+      invoke-exit "exit";
+    }
+    define-exit "exit" exit(1);
+    auto sem = new Semaphore;
+    while true {
+      spaceInSendQueue.acquire; // prevent us from calculating faster than we can send
+      
+      int id;
+      giveworkqueue.put λ(int i) { id = i; sem.release; };
+      sem.acquire;
+      
+      writeln "[$id] compute";
+      int grpsz = settings.groupsize;
+      int (dw, dh) = settings.imgres;
+      int from = id * grpsz, to = min(dw * dh, (id+1) * grpsz);
+      // render `id`
+      auto buffer = new vec4f[] (to - from);
+      setupMortonBuffer(id, buffer, λ{
+        render(id);
+      });
+      writeln "[$id] submit";
+      for ref v <- buffer v = max(vec3f 0, v); // compensate for negative brightnesses
+      resultqueue.put(id, buffer);
+    }
+  }
+  
+  void main_connect() {
+    auto socket = new Socket(host, port, allow-ipv6 => false);
+    writeln "Connected.";
+    
+    void sendln(string s) {
+      writeln scope= "[c] > $s";
+      socket.sendAll ubyte[]: s;
+      socket.sendAll ubyte[]: "\n";
+    }
+    
+    auto context = new UnforthContext;
+    setupDefaultWords(context);
+    setupPtWords(context);
+    context.define_builtin("render", new λ using context {
+      auto pre = context.pop!PreHandler();
+      dumpTree(pre);
+      
+      auto stream = pre.flatten();
+      configureStream stream;
+      
+      writeln "scene defined, $(stream.length) commands.";
+    });
+    
+    using new LineReader {
+      lines = splitAt(castIter!string readsocket socket, "\n");
+      verbose = "c";
+      alias startsWith = that.startsWith;
+      
+      sendln "hi";
+      expect "hello there";
+      sendln "configure me";
+      expect "okay";
+      while (true) {
+        if (auto rest = startsWith "resolution ") {
+          settings.imgres = rest.split(" ").(atoi _0, atoi _1);
+          continue;
+        }
+        if (auto rest = startsWith "inputline ") { inputline = rest.dup; continue; }
+        if (auto rest = startsWith "depth ") { settings.depth = rest.atoi(); continue; }
+        if (auto rest = startsWith "fov ") { fov = rest.atof(); continue; }
+        if (auto rest = startsWith "projscale ") { projscale = rest.atof(); continue; }
+        if (auto rest = startsWith "groupsize ") { settings.groupsize = rest.atoi(); continue; }
+        if (auto rest = startsWith "samples ") { settings.samples = rest.atoi(); continue; }
+        if (auto rest = startsWith "define ") {
+          auto key = (&rest).slice " ";
+          context.define(key.dup, rest.dup);
+          continue;
+        }
+        expect "done";
+        writeln "configured, setting up scene";
+        context.execute(inputline);
+        break;
+      }
+      
+      tp.addTask &sendResults;
+      for 0..settings.threads tp.addTask &worker;
+      
+      while (true) {
+        auto task = giveworkqueue.get();
+        sendln "gimme work";
+        if (auto rest = startsWith "do jobset ") {
+          task(atoi rest);
+          continue;
+        }
+        fail "unexpected response to work request: $(last_line)";
+      }
+    }
+  }
+  
+  set-handler (Error err) {
+    writeln "$(read-pretty-fcc-backtrace())\n$err";
+    printf(".");
+    invoke-exit "exit";
+  }
+  
+  define-exit "exit" exit(1);
+  
+  main_connect;
+}

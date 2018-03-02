@@ -1,0 +1,124 @@
+module floattest;
+
+import base, unforth, unforth_pt, render, vm, settings, scene.util;
+
+import std.file, std.random;
+
+void main(string[] args) {
+  if (args.length) {
+    base.rng = getPRNG(atoi args[0]);
+  }
+  
+  import c.fenv;
+  fesetround(FE_TONEAREST);
+  
+  string scene = "-1 0 5 vec3f 1 3 snowflake 0.96 0.96 0.98 vec3f color 0.3 0.3 0.3 vec3f -0.3 -0.3 -0.3 vec3f checkershine skyground-uniform group pathtrace render";
+  auto context = new UnforthContext;
+  if (exists "defs.uf") context.load "defs.uf";
+  setupDefaultWords(context);
+  setupPtWords(context);
+  context.define_builtin("render", new λ using context {
+    auto stream = context.pop!CommandHandler[];
+    configureStream stream;
+    writeln "scene defined, $(stream.length) commands.";
+  });
+  
+  settings.imgres = (1920, 1080);
+  settings.samples = 3;
+  settings.depth = 20;
+  
+  fov = 0.75f;
+  projscale = 1f;
+  
+  context.execute(scene);
+  
+  auto xstream = vm.fullStream;
+  int resn = settings.results-needed, rayn = settings.rays-needed;
+  
+  int (dw, dh) = settings.imgres;
+  
+  int count = 1;
+  
+  auto my-vm-map = new VMState[] count;
+  auto my-ray-map = new Ray[] (count * rayn);
+  auto my-res-map = new Result[] (count * resn);
+  
+  all_rayplanes = my-ray-map;
+  all_resplanes = my-res-map;
+  
+  rayplane_size = count;
+  resplane_size = count;
+  
+  memset(all_resplanes.ptr, 0, all_resplanes.length * size-of Result);
+  initPlaneMaps;
+  
+  auto state = my-vm-map.ptr;
+  auto rayplane = my-ray-map.ptr;
+  for int k <- 0 .. count {
+    alias rand = base.rand;
+    int x = rand() % dw, y = rand() % dh;
+    
+    // rayplane.pos = vec3f(0.839078, 0.251810, 4.732395);
+    // rayplane.dir = vec3f(0.765928, -0.149237, -0.625282);
+    // rayplane.pos = vec3f(0, 2, -4/3.0);
+    // rayplane.dir = vec3f(0.131572, -0.275106, 0.952368);
+    // rayplane.pos = (vec3f[]: [size_t:1062655406, 1048274392, 1083654555, 1073741824].dup)[0];
+    // rayplane.dir = (vec3f[]: [size_t:1059218931, 1052843503, 3207388373, 1065353216].dup)[0];
+    
+    coordsf_to_ray(dw, dh, vec2f(x, y), rayplane);
+    rayplane ++;
+    
+    state.stream = xstream;
+    using state {
+      result-id = -1;
+      ray-id = 0;
+    }
+    state ++;
+  }
+  
+  auto rayqueue = my-vm-map;
+  
+  alias hdl = rayqueue[0].handler;
+  
+  void dumpRay(Ray* rayp) {
+    alias ray = *rayp;
+    writeln "$(ray.pos.xyz) -> $(ray.dir.xyz)";
+    printf("%p %p %p -> %p %p %p\n", (*vec3i*:&ray.pos).(x, y, z), (*vec3i*:&ray.dir).(x, y, z));
+  }
+  
+  void dumpRes(Result* resp) {
+    writeln " success: $(resp.success)";
+    if (!resp.success) return;
+    writeln " fromInside: $(resp.hitFromInside)";
+    writeln " normal: $(resp.normal.xyz)";
+    writeln " reflect: $(resp.reflective-color.xyz)";
+    writeln " emit: $(resp.emissive-color.xyz)";
+    writeln " distance: $(resp.distance)";
+  }
+  
+  void dump() {
+    writeln "";
+    for int i <- 0..count {
+      printf("%i \n", i);
+      for int k <- 0..rayn {
+        printf("  %i ", k);
+        dumpRay(&my-ray-map[k*count+i]);
+      }
+      for int k <- 0..resn {
+        printf("  %i\n", k);
+        dumpRes(&my-res-map[k*count+i]);
+      }
+    }
+  }
+  
+  recordResultDg = λ(Ray* rayp, vec3f col, bool isBack, float factor, bool isMetroHit) { }; // discard
+  
+  dump;
+  while (hdl) {
+    auto _hdl = hdl;
+    hdl.process(rayqueue, 0, count);
+    writeln "--------------";
+    writeln "dumping after $(_hdl)";
+    dump;
+  }
+}

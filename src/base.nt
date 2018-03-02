@@ -1,10 +1,23 @@
 module base;
 
-import std.random;
-shared IRandom deflt_rng;
-void init() { deflt_rng = getPRNG(23); }
+import std.random, std.fun, std.string;
 
-float randf() { return std.random.base.randf deflt_rng; }
+IRandom rng;
+float randf() { return std.random.base.randf(rng); }
+int rand() { return rng.rand(); }
+void init() {
+  import std.thread;
+  rng = getPRNG(23);
+  auto dg = onThreadCreation;
+  onThreadCreation = new delegate void(void* basep) {
+    if (dg) { dg(basep); }
+    rng = getPRNG(int:basep);
+  };
+}
+
+alias eps = 0.0001;
+alias epsfl = 1 - eps; // epsilon factor less than one
+alias epsfg = 1 + eps; // epsilon factor greater than one
 
 struct Ray {
   vec3f pos, dir;
@@ -16,24 +29,98 @@ struct HdrTex {
   vec3f[] data;
 }
 
+// configure scene behavior for the ray we're tracing
+struct TraceInfo {
+  int flags;
+  alias WANT_INSIDE_HITS = 1;
+  alias WANT_OUTSIDE_HITS = 2;
+  bool wantInsideHits() { return flags&WANT_INSIDE_HITS == WANT_INSIDE_HITS; }
+  void wantInsideHits(bool b) { if (b) flags |= WANT_INSIDE_HITS; else flags = int:(size_t:flags & ¬WANT_INSIDE_HITS); }
+  bool wantOutsideHits() { return flags&WANT_OUTSIDE_HITS == WANT_OUTSIDE_HITS; }
+  void wantOutsideHits(bool b) { if (b) flags |= WANT_OUTSIDE_HITS; else flags = int:(size_t:flags & ¬WANT_OUTSIDE_HITS); }
+  void want(bool enter, leave) { wantOutsideHits enter; wantInsideHits leave; }
+  void flip() { want(enter => wantInsideHits(), leave => wantOutsideHits()); }
+  string toString() {
+    if (wantInsideHits() && wantOutsideHits()) return "want all hits";
+    else if (wantInsideHits()) return "want inside hits";
+    else if (wantOutsideHits()) return "want outside hits";
+    else return "want no hits";
+  }
+}
+
 import gd;
 struct Texture {
   gdImagePtr gdp;
   HdrTex* hdp;
 }
 
+struct BiasInfo {
+  bool usingBiasedSample;
+  float sampleFactor;
+}
+
+// save some space
+union AuxData {
+  BiasInfo b_info;
+  int data;
+}
+
 struct Result {
-  float distance;
   vec3f normal;
   vec3f reflective-color, emissive-color;
   alias col = reflective-color;
   vec2f texcoord; Texture* texinfo;
-  int data;
-  bool success;
-  void claim() {
+  float distance, reflect;
+  bool success, hitFromInside;
+  // used in path tracing for radiance caching state
+  AuxData aux_data;
+  (int, int) filler; // bring us up to 96 bytes (avoid issues on arm, where 16-byte vector alignment is not in the abi)
+  alias data = aux_data.data;
+  alias biasInfo = aux_data.b_info;
+  alias dataTuple = (distance, reflect, normal,
+    reflective-color, emissive-color,
+    texcoord, texinfo, success, hitFromInside);
+  void flip() {
+    if (success) {
+      if (distance == float.infinity) { // "universe" hit
+        success = false;
+        return;
+      }
+    } else {
+      hitUniverse;
+      return;
+    }
+    normal = -normal;
+    hitFromInside = !hitFromInside;
+  }
+  void hitUniverse() {
+    claim(
+      distance => float.infinity,
+      fromInside => true
+    );
+    reflective-color = vec3f(0);
+    // emissive-color = vec3f(100, 0, 100); // you should never ever see this
+    emissive-color = vec3f(0);
+  }
+  void copyFrom(Result* r2) {
+    if (!r2.success) { success = false; return; }
+    // dataTuple = r2.dataTuple;
+    assert(size-of Result == 16*6);
+    *(vec4f x 6)*:&this = *(vec4f x 6*):r2;
+  }
+  void claim(float distance, bool fromInside) {
+    assert(fromInside == false || fromInside == true);
+    /*if (size_t:&this % 16 != 0) {
+      printf("misaligned result %p\n", &this);
+      *int*:null=0;
+    }*/
     success = true;
     reflective-color = vec3f 1;
     emissive-color = vec3f 0;
+    reflect = 0;
+    this.distance = distance;
+    hitFromInside = fromInside;
+    biasInfo.usingBiasedSample = false;
   }
   string toString() {
     if (success) {
@@ -44,5 +131,165 @@ struct Result {
   }
 }
 
-
 interface CommandHandler;
+
+interface PreHandler {
+  CommandHandler[] flatten();
+  void iterate(void delegate(PreHandler));
+}
+
+class ArrayPreHandler : PreHandler {
+  PreHandler[] things;
+  void init(PreHandler thing) this.things = [thing].dup;
+  void init(PreHandler[] things) this.things = things;
+  override string toString() { return "[" ~ (for x in things map x.toString() eval[]).join(", ") ~ "]"; }
+  override void iterate(void delegate(PreHandler) dg) { for auto thing <- things dg thing; }
+  override CommandHandler[] flatten() {
+    CommandHandler[auto~] res;
+    for auto thing <- things res ~= scope= thing.flatten();
+    return res[];
+  }
+}
+
+void dumpTree(PreHandler handler) {
+  bool[auto~] last;
+  void recurse(int depth, PreHandler current) {
+    for int i <- 0..depth {
+      if (i == depth - 1) {
+        if last[i] printf "└─";
+        else printf "├─";
+      } else {
+        if last[i] printf("  ");
+        else printf("│ ");
+      }
+    }
+    
+    scope classinfo = "$current";
+    scope string temp;
+    auto name = classinfo;
+    if (auto rest = classinfo.startsWith "Pre") { temp = "<$rest>"; name = temp; }
+    int count;
+    current.iterate λ(PreHandler) { count++; }
+    
+    if (count) {
+      writeln scope= "┬$name";
+    } else {
+      writeln scope= "─$name";
+    }
+    
+    int i;
+    last ~= false;
+    current.iterate λ(PreHandler next) { if (++i == count) last[depth] = true; recurse(depth + 1, next); }
+    last.popEnd;
+  }
+  recurse(0, handler);
+}
+
+class CommandPreHandler : PreHandler {
+  CommandHandler thing;
+  void init(CommandHandler thing) this.thing = thing;
+  override string toString() { return "@"~thing.toString(); }
+  override void iterate(void delegate(PreHandler) dg) { }
+  override CommandHandler[] flatten() { return [thing].dup; }
+}
+
+shared float fov;
+shared float projscale;
+shared bool panini;
+void init() { panini = true; }
+
+alias d = 1;
+
+import c.math;
+
+vec3d latlon_to_ray(double lat, lon) {
+  double clat = cos lat;
+  return vec3d(clat * sin lon, sin lat, clat * cos lon);
+  /*
+  double sinlon = sin lon, sinlat = sin lat, coslon = cos lon;
+  double x = clat * sinlon, y = sinlat, z = clat * coslon;
+  // printf("lltr debug: clat %A sinlon %A sinlat %A coslon %A\n x %A y %A z %A\n", clat, sinlon, sinlat, coslon, x, y, z);
+  return vec3d(x, y, z);
+  */
+}
+
+// thanks http://math.stackexchange.com/questions/1098487/atan2-faster-approximation
+double atan2(double y, double x) {
+  double ax = fabs x, ay = fabs y;
+  double a = fmin(ax, ay) / fmax(ax, ay);
+  double s = a * a;
+  double r = ((-0.0464964749 * s + 0.15931422) * s - 0.327622764) * s * a + a;
+  if (ay > ax) r = 1.57079637 - r;
+  if (x < 0) r = 3.14159274 - r;
+  r = copysign(r, y);
+  return r;
+}
+
+(double lat, double lon) ray_to_latlon(vec3f dir) {
+  return dir.(lat => atan2(y, |xz|), lon => atan2(x, z));
+}
+
+vec2d ray_to_coordsf_panini(Ray* rayp) {
+  auto dir = rayp.dir;
+  double (lat, lon) = ray_to_latlon(dir);
+  double S = (d+1)/(d+cos lon);
+  return S * vec2d(sin lon, tan lat);
+}
+
+vec3d coordsf_to_ray_panini(float x, y) {
+  float k = x^2 / (d+1)^2;
+  float dscr = k^2 * d^2 - (k+1) * (k*d^2 - 1);
+  double sq = sqrt dscr;
+  double kd = k * d;
+  double clon = (-kd + sq)/(k+1);
+  double S = (d+1)/(d+clon);
+  double lon = atan2(x, S*clon);
+  double lat = atan2(y, S);
+  // printf("debug: k %p dscr %p sq %A kd %A\n clon %A S %A\n lon %A lat %A\n", k, dscr, sq, kd, clon, S, lon, lat);
+  return latlon_to_ray(lat, lon);
+}
+
+vec2f ray_to_coordsf(int dw, dh, Ray* rayp) {
+  float ratio = dw * 1f / dh;
+  if (panini) {
+    auto v = ray_to_coordsf_panini(rayp); // -1 .. 1
+    v = v / (fov * vec2f(ratio, -1)); // unskew
+    auto latlon = v * 0.5 + 0.5; // to 0..1
+    return vec2f(dw, dh) * latlon.(vec2f(float:x, float:y));
+  }
+  auto dir = rayp.dir;
+  dir /= dir.z; // denormalize
+  return vec2f(
+    (1f + (dir.x / (ratio * fov))) * (dw / 2f),
+    (1f - (dir.y / fov)) * (dh / 2f)
+  );
+}
+
+vec2i ray_to_coords(int dw, dh, Ray* rayp) {
+  auto v = ray_to_coordsf(dw, dh, rayp);
+  return vec2i(int:(v.x + 0.5), int:(v.y + 0.5));
+}
+
+void coordsf_to_ray(int dw, dh, vec2f v, Ray* rayp) {
+  float ratio = dw * 1f / dh;
+  if (panini) {
+    v = (v / vec2f(dw, dh)) * 2 - 1; // to -1..1
+    v = vec2f(ratio, -1) * fov * v; // skew
+    rayp.pos = vec3f(0f, 2f, -projscale/fov);
+    // printf("DEBUG: %p / %p = %p\n", projscale, fov, rayp.pos.z);
+    auto ctrp = coordsf_to_ray_panini(v);
+    auto ctrp_f = ctrp.(vec3f(float:x, float:y, float:z));
+    auto ctrp_fn = ctrp_f.normalized;
+    // printf("deBUG: %A %A %A\n %A %A %A\n %A\n %A %A %A\n", ctrp.(x, y, z), ctrp_f.(double:x, double:y, double:z), double: |ctrp_f|, ctrp_fn.(double:x, double:y, double:z));
+    rayp.dir = ctrp_fn;
+    return;
+  }
+  rayp.pos = vec3f(0f, 2f, -projscale/fov);
+  rayp.dir = vec3f(
+    ratio * fov * (v.x / (dw / 2) - 1),
+            fov * (1 - v.y / (dh / 2)),
+    1
+  ).normalized;
+}
+
+void delegate(Ray* rayp, vec3f col, bool isBack, float factor, bool isMetroHit) recordResultDg;

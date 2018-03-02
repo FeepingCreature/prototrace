@@ -1,24 +1,30 @@
 module scene.metro;
 
+import scene.(base, util, lighting);
+
 bool allowLensmut;
 
-/*class MetropolisLighting : SceneObject {
-  SceneObject sup; int samples, depth;
-  void init(SceneObject sup) {
+class MetropolisLighting : SceneObject {
+  CommandHandler[] sup; int samples, depth;
+  void init(CommandHandler[] sup) {
     this.(sup, depth, samples) = (sup, 3, 16);
   }
-  void init(SceneObject sup, int dep, int samples) {
+  void init(CommandHandler[] sup, int dep, int samples) {
     this.(sup, depth, samples) = (sup, dep, samples);
   }
   class MetropolisStep : CommandHandler {
     int stepsToRewind;
     int firstRay, firstRes, skip;
+    bool irregularStep() { return true; }
+    void recordEffect(VMStats* stats) { }
     class Mutate1 : CommandHandler {
       int firstRay, firstRes, skip;
       void init(int firstId, firstResId, skipLen) (firstRay, firstRes, skip) = (firstId, firstResId, skipLen);
-      void process(VMState[] list) {
+      bool irregularStep() { return false; }
+      void recordEffect(VMStats* stats) { stats.addsRay(); }
+      void process(VMState[] list, int from, to) {
         bool allowLensmut = allowLensmut;
-        for int i <- 0 .. list.length {
+        for int i <- from..to {
           auto sp = &list[i];
           
           if (void*:sp.handler == void*:CommandHandler:this)::
@@ -44,7 +50,7 @@ bool allowLensmut;
             if (fx < 0) fx = 0; if (fx > dw - 1) fx = dw - 1;
             if (fy < 0) fy = 0; if (fy > dh - 1) fy = dh - 1;
             
-            coordsf_to_ray(dw, dh, fx, fy, &rayplanes[sp.ray-id-1][i]);
+            coordsf_to_ray(dw, dh, fx, fy, &rayplanes[sp.ray-id][i]);
             
             resplanes[firstRes][i].data = 0; // lens mutation in progress
           } else if (whichCase == 2) {
@@ -61,10 +67,10 @@ bool allowLensmut;
             if (ray_offset) {
               res = &resplanes[firstRes + ray_offset - 1][i];
               ray = &rayplanes[firstRes + ray_offset - 1][i];
-              generateOutRay(&rayplanes[sp.ray-id-1][i], ray, ray.pos, res);
+              generateOutRay(&rayplanes[sp.ray-id][i], ray, ray.pos, res);
               resplanes[firstRes][i].data = ray_offset + 1;
             } else {
-              rayplanes[sp.ray-id-1][i] = rayplanes[firstRes][i]; // safe default
+              rayplanes[sp.ray-id][i] = rayplanes[firstRes][i]; // safe default
               sp.state = -1; // skip
             }
           } else {
@@ -78,19 +84,19 @@ bool allowLensmut;
     class Mutate2 : CommandHandler {
       int firstRay, firstRes, skip;
       void init(int firstId, firstResId, skipLen) (firstRay, firstRes, skip) = (firstId, firstResId, skipLen);
-      void process(VMState[] list) {
-        for int i <- 0 .. list.length {
+      void process(VMState[] list, int from, to) {
+        for int i <- from..to {
           auto sp = &list[i];
           
           if (void*:sp.handler == void*:CommandHandler:this)::
           sp.stream = sp.stream[1..$];
           
           // skip if tail mutating
-          if (sp.state != 0 /* no second ray * /) {
+          if (sp.state != 0 /* no second ray */) {
             using sp { mixin(allocRay); mixin(allocResult); }
             sp.stream = sp.stream[skip..$];
           } else::
-          auto ray = &rayplanes[sp.ray-id-1][i], res = &resplanes[sp.result-id-1][i];
+          auto ray = &rayplanes[sp.ray-id][i], res = &resplanes[sp.result-id][i];
           auto oldray2 = &rayplanes[firstRay + 1][i];
           auto oldres2 = &resplanes[firstRes + 1][i];
           
@@ -99,7 +105,7 @@ bool allowLensmut;
           
           if (!oldres2.success) res.success = false;
           else::
-          auto nuray = &rayplanes[sp.ray-id-1][i];
+          auto nuray = &rayplanes[sp.ray-id][i];
           nuray.pos = ray.(pos + dir * (res.distance * EPS));
           nuray.dir = oldray2.(pos + oldres2.distance * dir) - nuray.pos;
           if (nuray.dir.magnitude == 0) {
@@ -118,8 +124,8 @@ bool allowLensmut;
     CommandHandler mkTestRaySelector2(int baseRay, baseRes, skip) {
       return new Mutate2 (baseRay, baseRes, skip);
     }
-    void process(VMState[] list) {
-      for int i <- 0 .. list.length {
+    void process(VMState[] list, int from, to) {
+      for int i <- from..to {
         auto sp = &list[i];
         
         if (void*:sp.handler == void*:CommandHandler:this)::
@@ -140,13 +146,13 @@ bool allowLensmut;
             if (data > 0) {
               // writeln "CASE1: $(data - 1) tail mutate";
               tailOffset = data - 1;
-              auto res1 = &resplanes[sp.result-id-1][i];
+              auto res1 = &resplanes[sp.result-id][i];
               if (res1.reflective-color != vec3f(0)) {
                 retry = true; // not part of the environment :(
               } else {
                 flipPath = delegate void() {
-                  swap rayplanes[firstRay + tailOffset][i], rayplanes[sp.ray-id-2][i];
-                  swap resplanes[firstRes + tailOffset][i], resplanes[sp.result-id-2][i];
+                  swap rayplanes[firstRay + tailOffset][i], rayplanes[sp.ray-id-1][i];
+                  swap resplanes[firstRes + tailOffset][i], resplanes[sp.result-id-0][i];
                   sp.cached = false;
                 };
               }
@@ -154,8 +160,8 @@ bool allowLensmut;
               // writeln "CASE2: lens mutate";
               auto res11 = &resplanes[firstRes][i];
               auto res12 = &resplanes[firstRes + 1][i];
-              auto res21 = &resplanes[sp.result-id-2][i];
-              auto res22 = &resplanes[sp.result-id-1][i];
+              auto res21 = &resplanes[sp.result-id-1][i];
+              auto res22 = &resplanes[sp.result-id-0][i];
               retry = true;
               
               // scenery mode!
@@ -163,8 +169,8 @@ bool allowLensmut;
                 retry = false;
                 flipPath = \{
                   alias rp = rayplanes, ep = resplanes;
-                  swap rp[firstRay][i], rp[sp.ray-id-2][i];
-                  swap ep[firstRes][i], ep[sp.result-id-2][i];
+                  swap rp[firstRay][i], rp[sp.ray-id-1][i];
+                  swap ep[firstRes][i], ep[sp.result-id-1][i];
                   sp.cached = false;
                 };
               } else::
@@ -176,7 +182,7 @@ bool allowLensmut;
               if (normalsDiffer) newpathfail = true;
               if (res22.distance == 0) newpathfail = true;
               else {
-                if (res21.normal * rayplanes[sp.ray-id-1][i].dir #.sum < 0) {
+                if (res21.normal * rayplanes[sp.ray-id][i].dir #.sum < 0) {
                   // second ray of lens mutation would have taken us into an object
                   newpathfail = true;
                 }
@@ -186,8 +192,8 @@ bool allowLensmut;
               {
               } else::
               // scale by min distance traversed; smooth out rounding errors
-              auto cpt1 = rayplanes[firstRay + 1][i].(pos + dir * res12.distance);
-              auto cpt2 = rayplanes[sp.ray-id-1][i] .(pos + dir * res22.distance);
+              auto cpt1 = rayplanes[firstRay+1][i].(pos + dir * res12.distance);
+              auto cpt2 = rayplanes[sp.ray-id ][i] .(pos + dir * res22.distance);
               auto delta = |cpt1 - cpt2|;
               delta /= [res12.distance, res22.distance][res22.distance < res12.distance];
               // connect the ray and rewind
@@ -198,10 +204,10 @@ bool allowLensmut;
                 retry = false;
                 flipPath = \{
                   alias rp = rayplanes; alias ep = resplanes;
-                  swap rp[firstRay  ][i], rp[sp.ray-id-2][i];
-                  swap rp[firstRay+1][i], rp[sp.ray-id-1][i];
-                  swap ep[firstRes  ][i], ep[sp.result-id-2][i];
-                  swap ep[firstRes+1][i], ep[sp.result-id-1][i];
+                  swap rp[firstRay  ][i], rp[sp.ray-id-1][i];
+                  swap rp[firstRay+1][i], rp[sp.ray-id-0][i];
+                  swap ep[firstRes  ][i], ep[sp.result-id-1][i];
+                  swap ep[firstRes+1][i], ep[sp.result-id-0][i];
                   sp.cached = false;
                 };
               }
@@ -209,8 +215,8 @@ bool allowLensmut;
           } else {
             // writeln "set flipPath for case2: $depth";
             flipPath = delegate void() {
-              auto start1 = sp.ray-id    - depth,
-                   start2 = sp.result-id - depth;
+              auto start1 = sp.ray-id    - depth + 1,
+                   start2 = sp.result-id - depth + 1;
               for int k <- 0..depth {
                 swap rayplanes[firstRay+k][i], rayplanes[start1+k][i];
                 swap resplanes[firstRes+k][i], resplanes[start2+k][i];
@@ -241,7 +247,7 @@ bool allowLensmut;
               auto v2 = evaluateRay(quad, numFree, isBack => &bool isBackground2), f2 = value(v2, isBackground2);
               /*if (isBackground1 || isBackground2) {
                 writeln "for $(isBackground1), $(isBackground2): $f1, $f2, $v1, $v2";
-              }* /
+              }*/
               if (f2 >= f1) { // always switch to
                 recordState(quad, v2, isBackground2, 1);
               } else if (f1 != 0) { // prevent div0 bug
@@ -249,7 +255,7 @@ bool allowLensmut;
                 float r = randf();
                 float ratio = f2 / f1;
                 // old ray is swapped to end
-                recordState(sp, i, sp.ray-id - numFree, sp.result-id - numFree, v1, isBackground1, 1 - ratio);
+                recordState(sp, i, sp.ray-id - numFree + 1, sp.result-id - numFree + 1, v1, isBackground1, 1 - ratio);
                 recordState(quad, v2, isBackground2, ratio);
                 if (r < ratio) { // switch to
                 } else { // stay
@@ -262,7 +268,7 @@ bool allowLensmut;
               sp.stream = sp.stream.ptr[-stepsToRewind + 1 .. sp.stream.length];
               // standard path tracing
               /*flipPath();
-              sp.stream = sp.stream.ptr[-stepsToRewind .. sp.stream.length];* /
+              sp.stream = sp.stream.ptr[-stepsToRewind .. sp.stream.length];*/
             }
           }
         }
@@ -271,33 +277,24 @@ bool allowLensmut;
       }
     }
   }
-  CommandHandler[] buildCommandStream(VMStats* stats) {
+  CommandHandler[] buildCommandStream() {
     CommandHandler[auto~] res;
     
     for (0..samples) {
-      auto startinfo = stats.(rays-needed-cur, results-needed-cur);
-      
       res ~= new CopyRay;
-      stats.needsRay;
       
-      int baseRay = stats.rays-needed-cur - 1; // ray is already created
-      int baseRes = stats.results-needed-cur; // result will be created
-      int baseSkip;
-      alias baseTup = (baseRay, baseRes, baseSkip);
+      alias baseTup = (1, 0, sup.length);
       CommandHandler[] buildPathTrace() {
         PathTraceStep lastPTStep;
         int i = 1;
         CommandHandler[auto~] res;
         do {
-          auto stream = sup.buildCommandStream(stats);
-          if (lastPTStep) lastPTStep.skip = stream.length;
-          baseSkip = stream.length;
-          res ~= stream;
+          if (lastPTStep) lastPTStep.skip = sup.length;
+          res ~= sup;
         } while (i++ < depth) {
           using new PathTraceStep {
             lastPTStep = that;
             res ~= that;
-            stats.needsRay;
           }
         }
         return res[];
@@ -307,30 +304,23 @@ bool allowLensmut;
       // res += depth
       // rays += depth
       int rewindpos = res.length;
-      res ~= new RecordResultStep(baseRay, baseRes);
+      res ~= new RecordResultStep(1, 0);
       using new MetropolisStep {
         (firstRay, firstRes, skip) = baseTup;
         res ~= mkTestRaySelector baseTup; // doesn't add a ray if state == 2
-        stats.needsRay;
         CommandHandler[] part1, part2;
         // if (state == 2) .. 
         // make use of rays-needed-cur++
-        part1 ~= new RandomizeRay(baseRay/* - 1* /); // offer a new random path
+        part1 ~= new RandomizeRay(baseRay/* - 1*/); // offer a new random path
         part1 ~= buildPathTrace();
         // reset
-        stats.rays-needed-cur -= depth;
-        stats.results-needed-cur -= depth;
-        stats.needsRay; // restore
         // .. else ..
-        part2 ~= sup.buildCommandStream(stats); // results ++
+        part2 ~= sup; // results ++
         part2 ~= mkTestRaySelector2 baseTup;
-        stats.needsRay;
-        part2 ~= sup.buildCommandStream(stats); // results ++
+        part2 ~= sup; // results ++
         // .. end if
         res ~= mkIfElse(2, part1, part2);
         // reset
-        stats.rays-needed-cur -= 2;
-        stats.results-needed-cur -= 2;
         
         res ~= that;
         
@@ -342,10 +332,7 @@ bool allowLensmut;
         res ~= fr;
         res ~= fs;
       }
-      stats.rays-needed-cur -= depth;
-      stats.results-needed-cur -= depth;
-      assert(eval stats.(rays-needed-cur == startinfo[0] && results-needed-cur == startinfo[1]), "Ray/res allocation mismatch! ");
     }
     return res[];
   }
-}*/
+}

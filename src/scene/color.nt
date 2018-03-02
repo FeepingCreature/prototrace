@@ -2,6 +2,17 @@ module scene.color;
 
 import scene.base;
 
+class PreShine : PreHandler {
+  vec3f color;
+  PreHandler base;
+  void init(vec3f color, PreHandler base) this.(color, base) = (color, base);
+  override string toString() { return "PreShine $color"; }
+  override void iterate(void delegate(PreHandler) dg) { dg base; }
+  override CommandHandler[] flatten() { return (scope= base.flatten()) ~ new Shine(color, null); }
+}
+
+PreHandler mkShine(vec3f color, PreHandler base) return new PreShine(color, base);
+
 // used for purely emissive surfaces, like sky or lamps
 class Shine : SceneObject, CommandHandler {
   SceneObject sup;
@@ -9,6 +20,7 @@ class Shine : SceneObject, CommandHandler {
   void init(vec3f col, SceneObject so) { sup = so; this.col = col; }
   bool collide(Ray* ray, Result* res) { raise new Error "Shine::collide not implemented! "; }
   override {
+    bool irregularStep() { return false; }
     string toString() return "Shine\t$col";
     void process(VMState[] list, int start, end) {
       auto self = CommandHandler:this;
@@ -18,9 +30,11 @@ class Shine : SceneObject, CommandHandler {
         if (sp.handler !is self) continue;
         sp.stream = sp.stream[1..$];
         
-        ref res = resplanes[sp.result-id-1][i];
+        // printf("debug: %p %p\n", this, &col);
+        
+        ref res = resplanes[sp.result-id][i];
         res.emissive-color = col;
-        res.reflective-color = vec3f(0);
+        // res.reflective-color = vec3f(0);
       }
     }
     void recordEffect(VMStats* stats) { }
@@ -30,12 +44,24 @@ class Shine : SceneObject, CommandHandler {
   }
 }
 
+class PreColor : PreHandler {
+  vec3f color;
+  PreHandler base;
+  void init(vec3f color, PreHandler base) this.(color, base) = (color, base);
+  override string toString() { return "PreColor $color"; }
+  override void iterate(void delegate(PreHandler) dg) { dg base; }
+  override CommandHandler[] flatten() { return (scope= base.flatten()) ~ new Color(color, null); }
+}
+
+PreHandler mkColor(vec3f color, PreHandler base) return new PreColor(color, base);
+
 class Color : SceneObject, CommandHandler {
   SceneObject sup;
   vec3f col;
   void init(vec3f col, SceneObject so) { sup = so; this.col = col; }
   bool collide(Ray* ray, Result* res) { raise new Error "Color::collide not implemented! "; }
   override {
+    bool irregularStep() { return false; }
     string toString() return "Color\t$col";
     void process(VMState[] list, int start, end) {
       auto col = col;
@@ -45,9 +71,9 @@ class Color : SceneObject, CommandHandler {
         if (sp.handler !is CommandHandler:this) continue;
         sp.stream = sp.stream[1..$];
         
-        ref res = resplanes[sp.result-id-1][i];
+        ref res = resplanes[sp.result-id][i];
         res.reflective-color = col;
-        res.emissive-color = vec3f(0);
+        // res.emissive-color = vec3f(0);
       }
     }
     void recordEffect(VMStats* stats) { }

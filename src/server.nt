@@ -1,0 +1,250 @@
+module server;
+
+import std.(socket, thread, string, file, getopt, math, util, zlib, time);
+
+import morton, file, unforth, settings, base, lines;
+
+class ReadBytes : Iterator!string {
+  Iterator!string sup;
+  string backing;
+  int left;
+  bool advance() {
+    if (!left) return false;
+    
+    while (!backing.length) {
+      if (!backing <- sup) {
+        fail "ran out of data but was still supposed to read some!";
+      }
+    }
+    int to_take = min(left, backing.length);
+    (value, backing) = backing[(0..to_take, to_take..$)];
+    left -= to_take;
+    return true;
+  }
+  Iterator!string rest() { return std.string.wrap!string(cat(once backing, sup)); }
+}
+
+ReadBytes readBytes(int bytes, Iterator!string sup) {
+  auto res = new ReadBytes;
+  res.sup = sup;
+  res.left = bytes;
+  return res;
+}
+
+void handleClient(Socket client, UnforthContext context, int delegate() getTask, void delegate(int, string, vec4f[]) receivedResult) {
+  onFailure { client.close(); }
+  
+  set-handler (SocketError err) {
+    writeln "$err";
+    invoke-exit "return";
+  }
+  define-exit "return" return;
+  
+  auto split_lines = splitAt(castIter!string readsocket client, "\n");
+  using new LineReader {
+    lines = split_lines;
+    setVerbose true;
+    void sendln(string s) {
+      client.sendAll ubyte[]: s;
+      client.sendAll ubyte[]: "\n";
+    }
+    
+    string name;
+    if (accept "hi") {
+      name = client.getRemoteAddress().asString();
+    } else if (auto rest = that.startsWith "hi im ") {
+      name = rest.dup;
+    } else fail "expected greeting, not $(last_line)";
+    
+    sendln "hello there";
+    while (true) {
+      if (accept("configure me")) {
+        sendln "okay";
+        sendln settings.imgres.("resolution $_0 $_1");
+        sendln "depth $(settings.depth)";
+        sendln "inputline $(settings.input)";
+        sendln "fov $(fov)";
+        sendln "projscale $(projscale)";
+        sendln "samples $(settings.samples)";
+        sendln "groupsize $(settings.groupsize)";
+        for string (key, value) <- context.userdefs {
+          sendln scope= "define $key $value";
+        }
+        context.macros.iterate \(string key, string[] values) {
+          scope valuestr = values.join " ";
+          sendln scope= "define $key immediate $valuestr";
+        }
+        sendln "done";
+        continue;
+      }
+      if (accept("gimme work")) {
+        sendln "do jobset $(getTask())";
+        continue;
+      }
+      if (auto rest = that.startsWith "sending jobset ") {
+        auto parts = rest.split(" ");
+        if (parts.length != 2) fail "jobset requires two parameters, id and length";
+        int (id, length) = parts.(atoi _0, atoi _1);
+        
+        auto byte_reader = readBytes(length, split_lines.rest());
+        auto decompressed_data = vec4f[]: inflate ubyte[]: scope= byte_reader.join();
+        receivedResult(id, name, decompressed_data);
+        
+        split_lines = splitAt(byte_reader.rest(), "\n"); // back to line mode
+        lines = split_lines;
+        sendln "thanks";
+        continue;
+      }
+      fail "unexpected input $(last_line)";
+    }
+  }
+}
+
+template all(T) {
+  bool all(T t) { for auto e <- t if !e return false; return true; }
+}
+
+void main(string[] args) {
+  break-on-float-errors = true;
+  fov = 0.75;
+  projscale = 1;
+  
+  settings.groupsize = 16384;
+  
+  using new Options using settings {
+    addLong("average",     "a", λ average = true; );
+    addLong("minbrightnessfactor", "b", λ(string s) minBrightnessFactor = atof s; );
+    // addLong("count",       "c", λ(string s) count = atoi s; );
+    addLong("depth",       "d", λ(string s) depth = atoi s; );
+    // addLong("savestep",    "e", λ(string s) savestep = atof s; ); // TODO
+    // addLong("fps",         "f", λ(string s) desired-fps = std.string.atof s; );
+    addLong("groupsize",   "g", λ(string s) groupsize = atoi s;);
+    addLong("help",        "h", λ{ printHelp; exit 0; });
+    addLong("input",       "i", λ(string s) input = s;);
+    addLong("keepgoing",   "k", λ break-on-float-errors = false; );
+    // addLong("burninlimit", "l", λ(string s) burnInLimit = atoi s; );
+    // addLong("markovsteps", "m", λ(string s) markovSteps = atoi s; );
+    // addLong("boehm",       "n", λ useBoehm = true; );
+    addLong("output",      "o", λ(string s) file = s; );
+    // addLong("projscale",   "p", λ(string s) projscale = std.string.atof s; );
+    addLong("dumpmodgraph","q", λ { import std.process; dumpModuleGraph(); exit 0; });
+    addLong("res",         "r", λ(string s) using s.split "x" imgres = (atoi that[0], atoi that[1]); );
+    addLong("samples",     "s", λ(string s) samples = atoi s; );
+    // addLong("threads",     "t", λ(string s) threads = atoi s; );
+    addLong("rcache",      "u", λ enableRCache = true; );
+    addLong("fov",         "v", λ(string s) fov = atof s; );
+    // addLong("saveframes",  "y", λ saveFrames = true; );
+    args = process args;
+  }
+  
+  if (settings.imgres.(!_0 || !_1)) {
+    writeln "server requires a resolution (-r) argument";
+    exit 1;
+  }
+  
+  if (!settings.input) {
+    writeln "server requires an input (-i) argument";
+    exit 1;
+  }
+  
+  auto context = new UnforthContext;
+  if (exists "defs.uf") context.load "defs.uf";
+  
+  // ceil()
+  int num_tasks = settings.(imgres.(_0 * _1 + groupsize - 1) / groupsize);
+  int tasks_left = num_tasks;
+  
+  auto received_results = new bool[] num_tasks;
+  
+  auto mutex = new Mutex;
+  
+  auto resbuffer = new vec4f[] (settings.imgres.(_0 * _1));
+  resbuffer[] = [for 0..resbuffer.length: vec4f.W * 0.0001]; // initialize for previews
+  
+  auto morton_window = morton_window(settings.imgres);
+  
+  import std.hashmap, std.sort;
+  Hashmap!(string, int) contribution;
+  
+  int cur_task_id; // round robin
+  int getTask() using LockedMutex:mutex {
+    assert(num_tasks > 0);
+    auto start_task_id = cur_task_id;
+    while (true) {
+      int res = cur_task_id ++;
+      if (cur_task_id == num_tasks) cur_task_id = 0;
+      if (!received_results[res]) return res;
+      if (cur_task_id == start_task_id) {
+        fail "logic error: all results received, but we are still running";
+      }
+    }
+  }
+  
+  auto last_saved = sec();
+  
+  void receivedResult(int id, string name, vec4f[] data) using LockedMutex:mutex {
+    if (received_results[id]) {
+      scope string[auto~] left;
+      for int i <- 0..num_tasks if !received_results[i] left ~= "$i";
+      scope list_left = left.join(", ");
+      for auto str <- left str.free;
+      
+      writeln "received redundant result '$id' of $num_tasks, discarding (left: $list_left)";
+      return;
+    }
+    writeln "received '$id' of $num_tasks.";
+    received_results[id] = true;
+    
+    (*contribution.get(name, =>allocate)) ++;
+    
+    int count = settings.groupsize;
+    int (dw, dh) = settings.imgres;
+    int from = id * count, to = min(dw * dh, (id + 1) * count);
+    
+    for (int k <- from .. to) && (auto col <- data) {
+      int (x, y) = morton[morton_window[k]];
+      assert(0 <= x < dw);
+      assert(0 <= y < dh);
+      int i = y * dw + x;
+      
+      import c.math;
+      float maxf(float a, b) { if (a > b) return a; else return b; }
+      if (col.(maxf(x, maxf(y, z))) > 1)
+        col /= log10f(col.(maxf(x, maxf(y, z)))) + 1;
+
+      resbuffer[i] = col;
+    }
+    
+    tasks_left --;
+    if (tasks_left == 0 || sec() - last_saved > 5) {
+      last_saved = sec();
+      saveAs(settings.file, resbuffer);
+      writeln "image saved";
+    }
+    if (tasks_left == 0) {
+      assert all received_results;
+      writeln "contributors";
+      (string, int)[auto~] contribs;
+      contribution.iterate λ(string name, int count) { contribs ~= (name, count); }
+      qsort(contribs, λ(string, int c1, string, int c2) { return c1 >= c2; });
+      for auto pair <- contribs writeln "$(pair[1]) / $num_tasks\t$(pair[0])";
+      writeln "shutting down.";
+      exit 0;
+    }
+  }
+  
+  auto tp = new ThreadPool();
+  
+  auto servsock = new Socket;
+  servsock.reuse true;
+  servsock.bind new TcpAddress("0.0.0.0", 2824);
+  servsock.listen 1;
+  writeln "Server listening.";
+  while (true) {
+    auto client = servsock.accept();
+    writeln "Connection from $(client.getRemoteAddress().asString())";
+    if (!tp.idleThreads) tp.addThread();
+    tp.addTask
+      λ(Socket client) { return new λ{ handleClient(client, context, &getTask, &receivedResult); }; }(client);
+  }
+}

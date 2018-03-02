@@ -1,0 +1,119 @@
+module unforth_pt; // set up unforth definitions for pt scene objects
+
+import unforth, settings;
+import scene.(
+  base, plane, sphere, color, util, group, translate, rotate,
+  scale, bound, lighting, checkerpattern, matrix, intersect);
+import std.wren;
+
+void setupPtWords(UnforthContext context) using context {
+  define_builtin("drop", new λ { tpop(); });
+  define_builtin("pick", new λ {
+    auto depth = pop!int();
+    if (depth >= datastack.length) raise new UnforthError "stack underflow in $depth pick";
+    tpush datastack[$-1 - depth];
+  });
+  
+  define_builtin("nothing", new λ { push nil; });
+  define_builtin("plane", new λ {
+    auto base = pop!vec3f(), normal = pop!vec3f();
+    push mkPlane(normal, base);
+  });
+  define_builtin("sphere", new λ {
+    auto radius = pop!float(), center = pop!vec3f();
+    push mkSphere(center, radius);
+  });
+  define_builtin("shine", new λ {
+    auto color = pop!vec3f(), pre = pop!PreHandler();
+    push mkShine(color, pre);
+  });
+  define_builtin("color", new λ {
+    auto color = pop!vec3f(), pre = pop!PreHandler();
+    push mkColor(color, pre);
+  });
+  auto mt = new MergeTwo;
+  define_builtin("group", new λ {
+    auto sb = pop!PreHandler(), sa = pop!PreHandler();
+    if (!sa && !sb) push nil;
+    else if (sa && !sb) push sa;
+    else if (sb && !sa) push sb;
+    else push mkGroup(sa, sb);
+  });
+  define_builtin("intersect", new λ {
+    auto sb = pop!PreHandler(), sa = pop!PreHandler();
+    if (!sa || !sb) push nil; // lol
+    push mkIntersect(sa, sb);
+  });
+  define_builtin("translate", new λ {
+    auto vec = pop!vec3f();
+    auto pre = pop!PreHandler();
+    push mkTranslate(vec, pre);
+  });
+  define_builtin("rotate", new λ {
+    auto angle = pop!float() * PI / 180, axis = pop!vec3f();
+    auto pre = pop!PreHandler();
+    push mkRotate(axis, angle, pre);
+  });
+  define_builtin("scale", new λ {
+    auto scalef = pop!vec3f();
+    auto pre = pop!PreHandler();
+    push mkScale(scalef, pre);
+  });
+  
+  define_builtin("matrixop", new λ {
+    auto mat = pop!Wren_Matrix4x4();
+    auto pre = pop!PreHandler();
+    push mkMatrixOp(&mat.mat, pre);
+  });
+  
+  define_builtin("negate", new λ {
+    auto pre = pop!PreHandler();
+    if (pre) {
+      push mkNegate(pre);
+    } else {
+      push new CommandPreHandler(new EverythingStep);
+    }
+  });
+  define_builtin("bound", new λ {
+    auto b = pop!vec3f(), a = pop!vec3f();
+    auto pre = pop!PreHandler();
+    push mkBoxBound(a, b, pre);
+  });
+  
+  define_builtin("pathtrace", new λ {
+    auto pre = pop!PreHandler();
+    push mkPathTraceLighting(pre, settings.samples, settings.depth);
+  });
+  /*define_builtin("metro", new λ{
+    scope stream = popStream;
+    push $ (new MetropolisLighting(stream, settings.depth, settings.samples)).buildCommandStream();
+  });*/
+  
+  define_builtin("dumpstream", new λ {
+    auto pre = pop!PreHandler();
+    auto stream = pre.flatten();
+    writeln " -- stream --";
+    VMStats stats;
+    stats.addsRay;
+    for auto thing <- stream {
+      thing.recordEffect &stats;
+      writeln "   $(stats.rays-needed-cur) $(stats.results-needed-cur) $(stats.info-needed-cur)  $thing";
+    }
+    writeln "$(stream.length) total";
+  });
+  define_builtin("checker", new λ {
+    auto b = pop!vec3f(), a = pop!vec3f();
+    auto pre = pop!PreHandler();
+    push mkCheckerPattern(a, b, emissive => false, pre);
+  });
+  define_builtin("checkershine", new λ {
+    auto b = pop!vec3f(), a = pop!vec3f();
+    auto pre = pop!PreHandler();
+    push mkCheckerPattern(a, b, emissive => true, pre);
+  });
+  define_builtin("reflect", new λ {
+    auto f = pop!float();
+    auto pre = pop!PreHandler();
+    push mkReflect(f, pre);
+  });
+}

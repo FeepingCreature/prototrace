@@ -1,0 +1,56 @@
+module file;
+
+import sdl, gd, settings, scene.texture, std.(string, file);
+
+void saveAs(string file, vec4f[] resbuffer) {
+  int (dw, dh) = settings.imgres;
+  
+  float avg_w = 0;
+  for (int k <- 0..dw*dh) {
+    avg_w += resbuffer[k].w;
+  }
+  avg_w /= dw * dh;
+  /*float max_x = 0;
+  for (int k <- 0..dw*dh) {
+    if (auto x = resbuffer[k].x) > max_x max_x = x;
+  }
+  if (max_x == 0f) max_x = 1;*/
+  if (file.endsWith(".hdr")) {
+    auto colbuffer = new vec3f[] (dw * dh);
+    if (settings.average) {
+      for (int k <- 0..dw*dh) {
+        colbuffer[k] = resbuffer[k].(xyz/avg_w);
+      }
+    } else {
+      for (int k <- 0..dw*dh) {
+        colbuffer[k] = resbuffer[k].(xyz/w);
+      }
+    }
+    auto data = encodeHDR(colbuffer, dw, dh);
+    colbuffer.free;
+    writeAll("._tmp_$file", data);
+    rename("._tmp_$file", file);
+    data.free;
+    return;
+  }
+  auto gdp = gdImageCreateTrueColor(settings.imgres);
+  onSuccess gdImageDestroy gdp;
+  for (int k <- 0..dw*dh) {
+    vec3f col;
+    if (settings.average) {
+      col = resbuffer[k].(xyz/avg_w);
+    } else {
+      col = resbuffer[k].(xyz/w);
+    }
+    float maxf(float a, b) return [a, b][b > a];
+    if (col.(maxf(x, maxf(y, z))) > 1)
+      col /= col.(maxf(x, maxf(y, z)));
+    // col = resbuffer[k].xxx / max_x;
+    int x = k % dw, y = k / dw;
+    gdp.tpixels[y][dw - 1 - x] = floatToIntColor col;
+  }
+  auto hdl = fopen ("._tmp_$file".toStringz(), "w");
+  gdImagePng(gdp, c.gd.FILE*: hdl);
+  fclose hdl;
+  rename("._tmp_$file", file);
+}

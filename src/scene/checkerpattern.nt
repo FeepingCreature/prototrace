@@ -2,35 +2,42 @@ module scene.checkerpattern;
 
 import scene.base;
 
-class CheckerPattern : SceneObject {
-  SceneObject sup;
+class CheckerPattern : CommandHandler {
   vec3f a, b;
-  void init(vec3f a, b, SceneObject so) { sup = so; this.(a, b) = (a, b); }
-  bool collide(Ray* ray, Result* res) {
-    if (!sup.collide(ray, res)) return false;
-    auto hitpos = ray.(pos + dir * res.distance);
-    auto hitpos_int = vec3i((hitpos).(int:x & 1, int:y & 1, int:z & 1));
-    bool checker = bool:((hitpos_int.x & 1) xor (hitpos_int.y & 1) xor (hitpos_int.z & 1));
-    res.col = [a, b][checker];
-    return true;
-  }
-  void process(VMState[] list) {
-    for int i <- 0..list.length {
-      auto sp = &list[i];
-      
-      if (void*:sp.handler == void*:CommandHandler:this)::
-      sp.stream = sp.stream[1..$];
-      
-      auto res = resplanes[sp.result-id - 1][i];
-      if (res.success) {
-        auto ray = rayplanes[sp.ray-id - 1][i];
-        auto hitpos = ray.(pos + dir * res.distance);
-        bool checker = bool:((int:hitpos.x & 1) xor (int:hitpos.y & 1) xor (int:hitpos.z & 1));
-        res.col = [a, b][checker];
+  bool emissive;
+  void init(vec3f a, b, bool emissive) { this.(a, b, emissive) = (a, b, emissive); }
+  override {
+    void recordEffect(VMStats* stats) { }
+    bool irregularStep() { return false; }
+    void process(VMState[] list, int from, to) {
+      for int i <- from..to {
+        ref sp = list[i];
+        
+        if (sp.handler !is CommandHandler:this) fail;
+        sp.stream = sp.stream[1..$];
+        
+        ref res = resplanes[sp.result-id][i];
+        if (res.success) {
+          float effdist = res.distance;
+          if (res.distance == float.infinity) effdist = float.max; // whuh
+          ref ray = rayplanes[sp.ray-id][i];
+          auto hitpos = ray.(pos + dir * effdist);
+          bool checker = bool:((hitpos - hitpos.(vec3f(floor x, floor y, floor z))) * 2).(int:x & 1 xor int:y & 1 xor int:z & 1);
+          if (emissive) res.emissive-color = [a, b][checker];
+          else res.reflective-color = [a, b][checker];
+        }
       }
     }
   }
-  CommandHandler[] buildCommandStream(VMStats* stats) {
-    return sup.buildCommandStream(stats) ~ this;
-  }
 }
+
+class PreCheckerPattern : PreHandler {
+  vec3f a, b;
+  bool emissive;
+  PreHandler base;
+  void init(PreHandler base, vec3f a, b, bool emissive) this.(base, a, b, emissive) = (base, a, b, emissive);
+  override void iterate(void delegate(PreHandler) dg) { dg base; }
+  override CommandHandler[] flatten() { return (scope= base.flatten()) ~ new CheckerPattern(a, b, emissive); }
+}
+
+PreHandler mkCheckerPattern(vec3f a, b, bool emissive, PreHandler base) { return new PreCheckerPattern(base, a, b, emissive); }

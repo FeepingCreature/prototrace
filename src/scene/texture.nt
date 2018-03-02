@@ -95,7 +95,7 @@ HdrTex* parseHDR(ubyte[] data, string fn) {
   for (int y <- 0..h) {
     // writeln "Read line $y";
     (int i, data) = takeNextChar;
-    void fail() { asm `int $3`; }
+    void fail() { _interrupt 3; }
     if (i != 2) fail;
     (int grn, int blu, data) = takeNextChar2;
     // writeln "grn $grn, blu $blu";

@@ -52,9 +52,9 @@ class Triangle : SceneObject {
       if (void*:sp.handler == void*:CommandHandler:this)::
       sp.stream = sp.stream[1..$];
       
-      (vec3f pos, vec3f dir) = rayplanes[sp.ray-id-1][i].(pos, dir);
+      (vec3f pos, vec3f dir) = rayplanes[sp.ray-id][i].(pos, dir);
       using sp mixin(allocResult);
-      auto res = &resplanes[sp.result-id-1][i];
+      auto res = &resplanes[sp.result-id][i];
       
       float dist = -(normal * (pos - a)).sum / (dir * normal).sum;
       if (dist < 0) res.success = false;
@@ -237,8 +237,6 @@ struct TriangleNode {
 
 int[] tricache;
 int hash;
-
-// extern(C) void fast_triangleset_process(Ray**, Result**, VMState*, int, TriangleInfo* info, TriangleNode *root, int* tricache, int *hashp, void* self);
 
 class TriangleSet : SceneObject {
   TriangleNode* root;
